@@ -1,35 +1,37 @@
-import { useEffect, useMemo, useState } from 'react';
-import { activePromiseOf } from '../engine/engine';
+import { useEffect, useState } from 'react';
 import { fmtDateTime } from '../engine/format';
-import type { Command, ProtectionStrategy, Role, ShelterState } from '../engine/types';
+import type { BeddingState, Command, Role } from '../engine/types';
 import { WorkerClient } from './client';
-import {
-  DraftPanel,
-  FamilyList,
-  InvariantsPanel,
-  LeavePanel,
-  NewFamilyForm,
-  PendingPlacementPanel,
-  ReceiptsPanel,
-  ROLE_LABEL,
-  RoomCard,
-  TasksPanel,
-} from './components';
+import { AnyCmd, InvariantsPanel, ROLE_LABEL, ReceiptsPanel, StatsBar } from './components';
+import { DeliverPage, NeedsPage, PackPage, ReturnsPage, TrackingPage } from './pages';
 
-const ROLES: Role[] = ['receptionist', 'duty', 'bed_manager'];
+const ROLES: Role[] = ['keeper', 'counter', 'auditor'];
+
+type TabKey = 'pack' | 'needs' | 'deliver' | 'returns' | 'tracking';
+
+const TABS: { key: TabKey; label: string }[] = [
+  { key: 'pack', label: '封拆包装' },
+  { key: 'needs', label: '人员需求' },
+  { key: 'deliver', label: '领取交付' },
+  { key: 'returns', label: '退回与补领' },
+  { key: 'tracking', label: '逐件追踪' },
+];
+
+const DEFAULT_TAB: Record<Role, TabKey> = {
+  keeper: 'pack',
+  counter: 'needs',
+  auditor: 'tracking',
+};
 
 export default function App() {
   const [client] = useState(() => new WorkerClient());
-  const [state, setState] = useState<ShelterState | null>(null);
+  const [state, setState] = useState<BeddingState | null>(null);
   const [role, setRole] = useState<Role>(() => {
-    const saved = localStorage.getItem('shelter-role');
-    return saved === 'duty' || saved === 'bed_manager' ? saved : 'receptionist';
+    const saved = localStorage.getItem('bedding-role');
+    return saved === 'counter' || saved === 'auditor' ? saved : 'keeper';
   });
+  const [tab, setTab] = useState<TabKey>(() => DEFAULT_TAB[role]);
   const [error, setError] = useState<string | null>(null);
-  const [draftFor, setDraftFor] = useState<string | null>(null);
-  const [leaveFor, setLeaveFor] = useState<string | null>(null);
-  /** 每个家庭最近一次暂离命令（用于演示“重复暂离回执”的幂等） */
-  const [lastLeaveCmd, setLastLeaveCmd] = useState<Record<string, Command>>({});
   const [tabId] = useState(() => Math.random().toString(36).slice(2, 6).toUpperCase());
 
   useEffect(() => {
@@ -37,59 +39,21 @@ export default function App() {
     void client.refreshState();
   }, [client]);
 
-  const run = async (cmd: Command): Promise<boolean> => {
-    const r = await client.cmd(cmd, role);
+  const exec = async (cmd: AnyCmd | Command): Promise<boolean> => {
+    const full: Command = ('commandId' in cmd ? cmd : { ...cmd, commandId: crypto.randomUUID() }) as Command;
+    const r = await client.cmd(full, role);
     if (!r.ok && r.error) setError(r.error);
     else setError(null);
     await client.refreshState();
     return r.ok;
   };
 
-  const newCmd = <T extends Omit<Command, 'commandId'>>(cmd: T): Command => ({
-    ...cmd,
-    commandId: crypto.randomUUID(),
-  }) as Command;
-
-  const handlers = useMemo(
-    () => ({
-      onStartDraft: (familyId: string) => {
-        setLeaveFor(null);
-        setDraftFor(familyId);
-      },
-      onCancelDraft: (assignmentId: string) => void run(newCmd({ type: 'CancelDraft', assignmentId })),
-      onSubmitCheckIn: (assignmentId: string) => void run(newCmd({ type: 'SubmitCheckIn', assignmentId })),
-      onStartLeave: (familyId: string) => {
-        setDraftFor(null);
-        setLeaveFor(familyId);
-      },
-      onReturn: (familyId: string) => void run(newCmd({ type: 'ConfirmReturn', familyId })),
-      onExtend: (familyId: string) => {
-        if (!state) return;
-        const p = activePromiseOf(state, familyId);
-        if (!p) return;
-        const base = Math.max(p.expectedReturnAt, state.virtualNow);
-        void run(newCmd({ type: 'ExtendPromise', familyId, newExpectedReturnAt: base + 3600_000 }));
-      },
-      onCheckout: (familyId: string) => void run(newCmd({ type: 'SubmitCheckout', familyId })),
-      onRetryStale: (familyId: string, roomId: string) => void run(newCmd({ type: 'CreateDraft', familyId, roomId })),
-      onDuplicateLeave: (familyId: string) => {
-        const cmd = lastLeaveCmd[familyId];
-        if (cmd) void run(cmd); // 相同 commandId 重发 → 幂等重复回执
-      },
-      canDuplicateLeave: (familyId: string) => !!lastLeaveCmd[familyId],
-    }),
-    [state, role, lastLeaveCmd],
-  );
-
   if (!state) return <div className="loading">正在加载本地数据…</div>;
-
-  const draftFamily = draftFor ? state.families.find((f) => f.id === draftFor) : null;
-  const leaveFamily = leaveFor ? state.families.find((f) => f.id === leaveFor) : null;
 
   return (
     <div className="app">
       <header className="topbar">
-        <div className="title">避难所入住与返所工作台</div>
+        <div className="title">夜间寝具柜台</div>
         <label className="role-select">
           当前角色：
           <select
@@ -97,7 +61,8 @@ export default function App() {
             onChange={(e) => {
               const r = e.target.value as Role;
               setRole(r);
-              localStorage.setItem('shelter-role', r);
+              localStorage.setItem('bedding-role', r);
+              setTab(DEFAULT_TAB[r]);
             }}
           >
             {ROLES.map((r) => (
@@ -108,16 +73,16 @@ export default function App() {
           </select>
         </label>
         <span className="clock">演示时间：{fmtDateTime(state.virtualNow)}</span>
-        <button onClick={() => void run(newCmd({ type: 'AdvanceClock', toVirtual: state.virtualNow + 15 * 60_000 }))}>
-          +15分钟
+        <button onClick={() => void exec({ type: 'AdvanceClock', toVirtual: state.virtualNow + 30 * 60_000 })}>
+          +30分钟
         </button>
-        <button onClick={() => void run(newCmd({ type: 'AdvanceClock', toVirtual: state.virtualNow + 3600_000 }))}>
+        <button onClick={() => void exec({ type: 'AdvanceClock', toVirtual: state.virtualNow + 3600_000 })}>
           +1小时
         </button>
         <button
           className="ghost"
           onClick={() => {
-            if (window.confirm('重置为初始演示场景？')) void run(newCmd({ type: 'ResetDemo' }));
+            if (window.confirm('重置为初始演示场景？')) void exec({ type: 'ResetDemo' });
           }}
         >
           重置演示数据
@@ -133,79 +98,28 @@ export default function App() {
         </div>
       )}
 
+      <StatsBar state={state} />
+
+      <nav className="tabs">
+        {TABS.map((t) => (
+          <button key={t.key} className={`tab ${tab === t.key ? 'tab-active' : ''}`} onClick={() => setTab(t.key)}>
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
       <div className="layout">
-        <section className="col">
-          <h2>房间看板</h2>
-          {state.rooms.map((room) => (
-            <RoomCard
-              key={room.id}
-              state={state}
-              room={room}
-              role={role}
-              onCloseRoom={(roomId) => {
-                const reason = window.prompt('关闭原因', '消杀临时关闭');
-                if (reason !== null) void run(newCmd({ type: 'CloseRoom', roomId, reason: reason || '临时关闭' }));
-              }}
-              onReopenRoom={(roomId) => void run(newCmd({ type: 'ReopenRoom', roomId }))}
-            />
-          ))}
-          <NewFamilyForm
-            role={role}
-            onSubmit={(input) => void run(newCmd({ type: 'RegisterFamily', input }))}
-          />
-        </section>
-
-        <section className="col">
-          <h2>家庭与操作</h2>
-          {draftFamily && (
-            <DraftPanel
-              state={state}
-              family={draftFamily}
-              onCancel={() => setDraftFor(null)}
-              onSubmit={(roomId) => {
-                void run(newCmd({ type: 'CreateDraft', familyId: draftFamily.id, roomId })).then((ok) => {
-                  if (ok) setDraftFor(null);
-                });
-              }}
-            />
-          )}
-          {leaveFamily && (
-            <LeavePanel
-              state={state}
-              family={leaveFamily}
-              onCancel={() => setLeaveFor(null)}
-              onSubmit={(strategy: ProtectionStrategy, protectionRoomId: string | undefined, hours: number) => {
-                const cmd = newCmd({
-                  type: 'RegisterLeave',
-                  familyId: leaveFamily.id,
-                  strategy,
-                  protectionRoomId,
-                  expectedReturnAt: state.virtualNow + hours * 3600_000,
-                });
-                void run(cmd).then((ok) => {
-                  if (ok) {
-                    setLastLeaveCmd((m) => ({ ...m, [leaveFamily.id]: cmd }));
-                    setLeaveFor(null);
-                  }
-                });
-              }}
-            />
-          )}
-          <FamilyList state={state} role={role} h={handlers} />
-        </section>
-
-        <section className="col">
-          <PendingPlacementPanel state={state} />
-          <TasksPanel
-            state={state}
-            role={role}
-            onExtend={handlers.onExtend}
-            onCheckout={handlers.onCheckout}
-            onNote={(taskId, note) => void run(newCmd({ type: 'AddTaskNote', taskId, note }))}
-          />
+        <main className="main-col">
+          {tab === 'pack' && <PackPage state={state} role={role} exec={exec} />}
+          {tab === 'needs' && <NeedsPage state={state} role={role} exec={exec} />}
+          {tab === 'deliver' && <DeliverPage state={state} role={role} exec={exec} />}
+          {tab === 'returns' && <ReturnsPage state={state} role={role} exec={exec} />}
+          {tab === 'tracking' && <TrackingPage state={state} role={role} exec={exec} />}
+        </main>
+        <aside className="side-col">
           <InvariantsPanel state={state} />
           <ReceiptsPanel receipts={state.receipts} />
-        </section>
+        </aside>
       </div>
     </div>
   );

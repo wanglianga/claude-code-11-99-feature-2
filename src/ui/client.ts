@@ -1,4 +1,4 @@
-import type { Command, Receipt, Role, ShelterState } from '../engine/types';
+import type { BeddingState, Command, Receipt, Role } from '../engine/types';
 
 export interface CmdResult {
   ok: boolean;
@@ -16,7 +16,7 @@ export class WorkerClient {
   private seq = 0;
   private pendingCalls = new Map<number, (msg: Record<string, unknown>) => void>();
   private bc: BroadcastChannel;
-  private listeners = new Set<(s: ShelterState) => void>();
+  private listeners = new Set<(s: BeddingState) => void>();
 
   constructor() {
     this.worker = new Worker(new URL('../worker/worker.ts', import.meta.url), { type: 'module' });
@@ -28,7 +28,7 @@ export class WorkerClient {
         resolve(m);
       }
     };
-    this.bc = new BroadcastChannel('shelter-workbench');
+    this.bc = new BroadcastChannel('bedding-counter');
     this.bc.onmessage = () => {
       void this.refreshState();
     };
@@ -47,9 +47,9 @@ export class WorkerClient {
     return m.result as CmdResult;
   }
 
-  async getState(): Promise<ShelterState> {
+  async getState(): Promise<BeddingState> {
     const m = await this.call('getState', {});
-    return m.state as ShelterState;
+    return m.state as BeddingState;
   }
 
   async refreshState(): Promise<void> {
@@ -57,7 +57,7 @@ export class WorkerClient {
     for (const l of this.listeners) l(s);
   }
 
-  onState(l: (s: ShelterState) => void): void {
+  onState(l: (s: BeddingState) => void): void {
     this.listeners.add(l);
   }
 }

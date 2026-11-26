@@ -1,7 +1,7 @@
 services:
   web:
     build: .
-    image: shelter-bed-workbench
+    image: bedding-counter
     ports:
       - "8080:80"
     restart: unless-stopped

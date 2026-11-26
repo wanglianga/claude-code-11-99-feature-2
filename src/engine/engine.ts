@@ -1,249 +1,331 @@
-import { fmtDateTime, fmtTime } from './format';
+import { fmtDateTime } from './format';
 import { seedState } from './seed';
 import type {
-  Assignment,
+  BeddingState,
   CmdCtx,
   CmdOutcome,
   Command,
-  ContactTask,
+  Delivery,
   Family,
-  PendingConfirmation,
-  PromiseStatus,
-  ProtectionStrategy,
+  ItemNode,
+  Need,
+  PackKind,
+  PendingReturn,
   Receipt,
-  ReturnPromise,
+  Reclaim,
   Role,
-  Room,
-  ShelterState,
+  Voucher,
 } from './types';
 
-/** 本地模拟适配器的异步确认时延（真实毫秒） */
-export const CHECKIN_DELAY_REAL_MS = 1200;
-export const CHECKOUT_DELAY_REAL_MS = 1500;
-
 export const ROLE_LABEL: Record<Role, string> = {
-  receptionist: '接待员',
-  duty: '楼层值班员',
-  bed_manager: '床位管理员',
+  keeper: '仓管员',
+  counter: '柜台职员',
+  auditor: '稽核员',
 };
 
-export const FAMILY_STATUS_LABEL: Record<Family['status'], string> = {
-  registered: '待安置',
-  draft: '草稿分房',
-  confirming: '入住确认中',
-  checked_in: '在场在住',
-  temp_leave: '暂离在外',
-  checked_out: '已退住',
+export const PACK_KIND_LABEL: Record<PackKind, string> = {
+  one_set: '一人套包',
+  four_pack: '四人包',
+  repack: '重封包',
 };
 
-export const STRATEGY_LABEL: Record<ProtectionStrategy, string> = {
-  keep_room: '原房原床保留',
-  capacity: '容量保护（返所换房）',
+export const PACK_PREFIX: Record<PackKind, string> = {
+  one_set: 'SET',
+  four_pack: 'PK4',
+  repack: 'RPK',
 };
 
-export const PROMISE_STATUS_LABEL: Record<PromiseStatus, string> = {
-  active: '有效',
-  fulfilled: '已兑现',
-  expired_contact: '已逾期·联系核实中',
-  cancelled: '已取消',
+export const ITEM_KIND_LABEL: Record<ItemNode['kind'], string> = {
+  mat: '垫子',
+  blanket: '毯子',
+  pack: '包',
 };
 
 const PERMS: Record<Command['type'], Role[] | 'any'> = {
-  RegisterFamily: ['receptionist'],
-  CreateDraft: ['receptionist'],
-  CancelDraft: ['receptionist'],
-  SubmitCheckIn: ['receptionist'],
-  RegisterLeave: ['receptionist'],
-  ConfirmReturn: ['receptionist'],
-  ExtendPromise: ['duty'],
-  SubmitCheckout: ['duty'],
-  AddTaskNote: ['duty'],
-  CloseRoom: ['bed_manager'],
-  ReopenRoom: ['bed_manager'],
+  RegisterFamily: ['counter'],
+  SplitFamily: ['counter'],
+  SealPack: ['keeper'],
+  OpenPack: ['keeper'],
+  DetachChild: ['keeper'],
+  MoveStock: ['keeper'],
+  Deliver: ['counter'],
+  ReceiveReturn: ['counter'],
+  Reclaim: ['counter'],
+  CompleteCleaning: ['keeper'],
   AdvanceClock: 'any',
   ResetDemo: 'any',
-  FinalizeDue: 'any',
 };
 
 // ---------------------------------------------------------------------------
 // 派生计算（纯函数，UI 与引擎共用同一口径）
 // ---------------------------------------------------------------------------
 
-export function familyById(state: ShelterState, id: string): Family {
+export function nodeById(state: BeddingState, id: string): ItemNode {
+  const n = state.nodes.find((x) => x.id === id);
+  if (!n) throw new Error(`物资节点不存在: ${id}`);
+  return n;
+}
+
+export function isLeaf(n: ItemNode): boolean {
+  return n.kind !== 'pack';
+}
+
+export function childrenOf(state: BeddingState, id: string): ItemNode[] {
+  return state.nodes.filter((n) => n.parentId === id);
+}
+
+/** 沿父链解析到根（核查单件时解析祖先；带成环保护） */
+export function rootOf(state: BeddingState, id: string): ItemNode {
+  let cur = nodeById(state, id);
+  const seen = new Set<string>([cur.id]);
+  while (cur.parentId) {
+    cur = nodeById(state, cur.parentId);
+    if (seen.has(cur.id)) throw new Error(`包含关系成环: ${cur.label}`);
+    seen.add(cur.id);
+  }
+  return cur;
+}
+
+/** 祖先链（含自身，根在前） */
+export function packPathOf(state: BeddingState, id: string): ItemNode[] {
+  const path: ItemNode[] = [];
+  let cur = nodeById(state, id);
+  const seen = new Set<string>();
+  for (;;) {
+    if (seen.has(cur.id)) throw new Error(`包含关系成环: ${cur.label}`);
+    seen.add(cur.id);
+    path.unshift(cur);
+    if (!cur.parentId) break;
+    cur = nodeById(state, cur.parentId);
+  }
+  return path;
+}
+
+/** 子树全部叶件（包壳不计寝具：只数垫/毯） */
+export function leavesOf(state: BeddingState, id: string): ItemNode[] {
+  const out: ItemNode[] = [];
+  const walk = (nid: string) => {
+    const n = nodeById(state, nid);
+    if (isLeaf(n)) {
+      out.push(n);
+      return;
+    }
+    for (const c of childrenOf(state, nid)) walk(c.id);
+  };
+  walk(id);
+  return out;
+}
+
+export interface LeafStats {
+  mats: number;
+  blankets: number;
+  leaves: number;
+  /** 人份 = 可组成的完整一垫一毯对数 */
+  portions: number;
+}
+
+export function leafStats(state: BeddingState, id: string): LeafStats {
+  const leaves = leavesOf(state, id);
+  const mats = leaves.filter((l) => l.kind === 'mat').length;
+  const blankets = leaves.filter((l) => l.kind === 'blanket').length;
+  return { mats, blankets, leaves: leaves.length, portions: Math.min(mats, blankets) };
+}
+
+/** 库存五态：可用 / 包内 / 已交付 / 待清洁 / 报损（由根位置与父包派生） */
+export type ItemStatus = 'available' | 'in_pack' | 'delivered' | 'cleaning' | 'damaged';
+
+export const ITEM_STATUS_LABEL: Record<ItemStatus, string> = {
+  available: '可用',
+  in_pack: '包内',
+  delivered: '已交付',
+  cleaning: '待清洁',
+  damaged: '报损',
+};
+
+export function effectiveStatus(state: BeddingState, node: ItemNode | string): ItemStatus {
+  const n = typeof node === 'string' ? nodeById(state, node) : node;
+  const root = rootOf(state, n.id);
+  const h = root.holder;
+  if (!h) throw new Error(`根节点缺少位置: ${root.label}`);
+  if (h.type === 'delivered') return 'delivered';
+  if (h.type === 'cleaning') return 'cleaning';
+  if (h.type === 'damaged') return 'damaged';
+  return n.parentId ? 'in_pack' : 'available';
+}
+
+export type LocationKey = 'warehouse' | 'counter' | 'delivered' | 'cleaning' | 'damaged';
+
+export function locationOf(state: BeddingState, node: ItemNode): LocationKey {
+  return rootOf(state, node.id).holder!.type;
+}
+
+export function locationLabel(state: BeddingState, node: ItemNode): string {
+  const root = rootOf(state, node.id);
+  const h = root.holder!;
+  switch (h.type) {
+    case 'warehouse':
+      return '库房';
+    case 'counter':
+      return '领取柜';
+    case 'cleaning':
+      return '待清洁区';
+    case 'damaged':
+      return '报损区';
+    case 'delivered': {
+      const d = state.deliveries.find((x) => x.id === h.deliveryId);
+      const fam = d ? state.families.find((f) => f.id === d.familyId) : undefined;
+      return `已交付·${fam?.name ?? '?'}`;
+    }
+  }
+}
+
+export function familyById(state: BeddingState, id: string): Family {
   const f = state.families.find((x) => x.id === id);
   if (!f) throw new Error(`家庭不存在: ${id}`);
   return f;
 }
 
-export function roomById(state: ShelterState, id: string): Room {
-  const r = state.rooms.find((x) => x.id === id);
-  if (!r) throw new Error(`房间不存在: ${id}`);
-  return r;
+export function needsOf(state: BeddingState, familyId: string): Need[] {
+  return state.needs
+    .filter((n) => n.familyId === familyId)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
 }
 
-export interface RoomBuckets {
-  capacity: number;
-  /** 实际在场（已确认入住） */
-  present: number;
-  /** 入住确认中（已预占，未计入在场） */
-  confirming: number;
-  /** 保护中（有效返所承诺占用） */
-  protected: number;
-  /** 草稿占用（仅展示，不参与分配） */
-  drafts: number;
-  /** 可分配 = 容量 - 在场 - 确认中 - 保护中 */
-  allocatable: number;
+export function fullyCovered(n: Need): boolean {
+  return !!n.matItemId && !!n.blanketItemId;
 }
 
-export function roomBuckets(state: ShelterState, roomId: string): RoomBuckets {
-  const room = roomById(state, roomId);
-  let present = 0;
-  let confirming = 0;
-  let protectedBeds = 0;
-  let drafts = 0;
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === roomId) present += f.size;
-  }
-  for (const a of state.assignments) {
-    if (a.roomId !== roomId) continue;
-    if (a.status === 'confirming') confirming += a.beds;
-    else if (a.status === 'draft_open') drafts += a.beds;
-  }
-  for (const p of state.promises) {
-    if (p.roomId === roomId && (p.status === 'active' || p.status === 'expired_contact')) {
-      protectedBeds += p.beds;
-    }
-  }
-  const allocatable =
-    room.status === 'open' ? Math.max(0, room.capacity - present - confirming - protectedBeds) : 0;
-  return { capacity: room.capacity, present, confirming, protected: protectedBeds, drafts, allocatable };
+export function voucherOf(state: BeddingState, familyId: string): Voucher | undefined {
+  return state.vouchers.find((v) => v.familyId === familyId);
 }
 
-/** 有效返所承诺（含逾期未归仍受保护的） */
-export function activePromiseOf(state: ShelterState, familyId: string): ReturnPromise | undefined {
-  return state.promises.find(
-    (p) => p.familyId === familyId && (p.status === 'active' || p.status === 'expired_contact'),
+export function deliveryById(state: BeddingState, id: string): Delivery | undefined {
+  return state.deliveries.find((d) => d.id === id);
+}
+
+/** 查原交付：物资当前根节点关联的交付单 */
+export function originalDeliveryOfItem(state: BeddingState, itemId: string): Delivery | undefined {
+  const root = rootOf(state, itemId);
+  if (root.holder?.type === 'delivered') return deliveryById(state, root.holder.deliveryId);
+  return undefined;
+}
+
+export function openPendingReturnsOf(state: BeddingState, familyId: string): PendingReturn[] {
+  return state.pendingReturns.filter((p) => p.familyId === familyId && p.status === 'open');
+}
+
+export function openReclaimOf(
+  state: BeddingState,
+  needId: string,
+  itemType: 'mat' | 'blanket',
+): Reclaim | undefined {
+  return state.reclaims.find(
+    (r) => r.needId === needId && r.itemType === itemType && r.status === 'awaiting_old',
   );
 }
 
-export function openDraftOf(state: ShelterState, familyId: string): Assignment | undefined {
-  return state.assignments.find((a) => a.familyId === familyId && a.status === 'draft_open');
+/** 柜台可交付的根节点：在领取柜、可用、且为叶件或封签完好的包 */
+export function deliverableRoots(state: BeddingState): ItemNode[] {
+  return state.nodes.filter(
+    (n) =>
+      n.parentId === null &&
+      n.holder?.type === 'counter' &&
+      (isLeaf(n) || (n.kind === 'pack' && !!n.seal)),
+  );
 }
 
-export function latestStaleDraftOf(state: ShelterState, familyId: string): Assignment | undefined {
-  const list = state.assignments.filter((a) => a.familyId === familyId && a.status === 'draft_stale');
-  return list.sort((a, b) => b.createdAt - a.createdAt)[0];
+/** 可作为封包材料的节点：叶件或封签完好的包；在库房/领取柜（根，或已开封包内的直接子件） */
+export function sealableNodes(state: BeddingState): ItemNode[] {
+  return state.nodes.filter((n) => {
+    if (!(isLeaf(n) || (n.kind === 'pack' && !!n.seal))) return false;
+    if (n.parentId === null) return n.holder?.type === 'warehouse' || n.holder?.type === 'counter';
+    const parent = state.nodes.find((p) => p.id === n.parentId);
+    if (!parent || parent.seal) return false; // 已封包内须先开封
+    const root = rootOf(state, n.id);
+    return root.holder?.type === 'warehouse' || root.holder?.type === 'counter';
+  });
 }
 
-export function pendingOf(
-  state: ShelterState,
-  familyId: string,
-  kind?: PendingConfirmation['kind'],
-): PendingConfirmation | undefined {
-  return state.pending.find((p) => p.familyId === familyId && (!kind || p.kind === kind));
+// ---------------------------------------------------------------------------
+// 交付预演（UI 预览与命令处理共用同一套核算）
+// ---------------------------------------------------------------------------
+
+export interface DeliverPlan {
+  errors: string[];
+  mats: ItemNode[];
+  blankets: ItemNode[];
+  lines: { need: Need; mat?: ItemNode; blanket?: ItemNode }[];
+  newlyCovered: Need[];
+  excessMats: ItemNode[];
+  excessBlankets: ItemNode[];
 }
 
-export function openTaskOf(state: ShelterState, familyId: string): ContactTask | undefined {
-  return state.contactTasks.find((t) => t.familyId === familyId && t.status === 'open');
-}
-
-/**
- * 房间资格核验：容量、整组不可拆、无障碍、共房同意须同时满足。
- * 返回问题列表，空数组表示可分配。extraProtected 用于关房重规划的模拟。
- */
-export function eligibility(
-  state: ShelterState,
-  family: Family,
-  room: Room,
-  extraProtected?: Record<string, number>,
-): string[] {
-  const issues: string[] = [];
-  if (room.status !== 'open') issues.push(`房间${room.name}已临时关闭`);
-  if (family.size > room.capacity)
-    issues.push(`整组${family.size}人超过${room.name}容量${room.capacity}床，家庭不可拆分`);
-  if (family.needsAccessible && !room.accessible)
-    issues.push(`需要无障碍设施，${room.name}为普通房`);
-  const b = roomBuckets(state, room.id);
-  const extra = extraProtected?.[room.id] ?? 0;
-  const avail = room.capacity - b.present - b.confirming - b.protected - extra;
-  if (family.size > avail)
-    issues.push(
-      `${room.name}可分配${Math.max(0, avail)}床 < ${family.size}人（在场${b.present}/确认中${b.confirming}/保护中${b.protected + extra}）`,
-    );
-  const others = new Set<string>();
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === room.id && f.id !== family.id) others.add(f.id);
+export function planDelivery(state: BeddingState, familyId: string, nodeIds: string[]): DeliverPlan {
+  const errors: string[] = [];
+  const fam = state.families.find((f) => f.id === familyId);
+  if (!fam) errors.push('家庭不存在');
+  const ids = [...new Set(nodeIds)];
+  if (ids.length === 0) errors.push('请选择要交付的物资');
+  const nodes: ItemNode[] = [];
+  for (const id of ids) {
+    const n = state.nodes.find((x) => x.id === id);
+    if (!n) {
+      errors.push(`物资不存在: ${id}`);
+      continue;
+    }
+    nodes.push(n);
+    if (n.parentId !== null) {
+      const parent = state.nodes.find((p) => p.id === n.parentId);
+      errors.push(`物资 ${n.label} 在包 ${parent?.label ?? ''} 内，须先由仓管开封取出`);
+      continue;
+    }
+    const h = n.holder;
+    if (!h) {
+      errors.push(`物资 ${n.label} 状态异常（根节点无位置）`);
+      continue;
+    }
+    if (h.type === 'warehouse') errors.push(`物资 ${n.label} 仍在库房，请先送到领取柜`);
+    else if (h.type === 'delivered') errors.push(`物资 ${n.label} 已交付（交付单 ${h.deliveryId}），不能重复交付`);
+    else if (h.type === 'cleaning') errors.push(`物资 ${n.label} 在待清洁区，未完成清洁`);
+    else if (h.type === 'damaged') errors.push(`物资 ${n.label} 已报损`);
+    else if (n.kind === 'pack' && !n.seal)
+      errors.push(`包 ${n.label} 已开封，包壳不能整包交付；请取出内容物或重新封包`);
   }
-  for (const p of state.promises) {
-    if (
-      p.roomId === room.id &&
-      (p.status === 'active' || p.status === 'expired_contact') &&
-      p.familyId !== family.id
-    )
-      others.add(p.familyId);
-  }
-  for (const a of state.assignments) {
-    if (a.roomId === room.id && a.status === 'confirming' && a.familyId !== family.id) others.add(a.familyId);
-  }
-  if (others.size > 0) {
-    if (!family.coRoomConsent) issues.push(`家庭未同意共房，${room.name}内已有其他家庭或返所保护`);
-    for (const oid of others) {
-      const of = state.families.find((f) => f.id === oid);
-      if (of && !of.coRoomConsent) issues.push(`${room.name}内「${of.name}」未同意共房`);
+  const leaves = errors.length ? [] : ids.flatMap((id) => leavesOf(state, id));
+  if (!errors.length && leaves.length === 0) errors.push('所选物资不含任何寝具叶件');
+  const mats = leaves.filter((l) => l.kind === 'mat').sort((a, b) => a.label.localeCompare(b.label));
+  const blankets = leaves
+    .filter((l) => l.kind === 'blanket')
+    .sort((a, b) => a.label.localeCompare(b.label));
+
+  const lines: DeliverPlan['lines'] = [];
+  const newlyCovered: Need[] = [];
+  let mi = 0;
+  let bi = 0;
+  const open = fam ? needsOf(state, fam.id).filter((n) => !fullyCovered(n)) : [];
+  for (const need of open) {
+    const line: DeliverPlan['lines'][number] = { need };
+    if (!need.matItemId && mi < mats.length) line.mat = mats[mi++];
+    if (!need.blanketItemId && bi < blankets.length) line.blanket = blankets[bi++];
+    if (line.mat || line.blanket) {
+      lines.push(line);
+      if ((need.matItemId || line.mat) && (need.blanketItemId || line.blanket)) newlyCovered.push(need);
     }
   }
-  return issues;
+  return {
+    errors,
+    mats,
+    blankets,
+    lines,
+    newlyCovered,
+    excessMats: mats.slice(mi),
+    excessBlankets: blankets.slice(bi),
+  };
 }
 
-/** 候选房间列表：可分配的排前，其次无障碍匹配，再按可分配床数排序 */
-export function suggestRooms(
-  state: ShelterState,
-  family: Family,
-): { room: Room; issues: string[] }[] {
-  return state.rooms
-    .map((room) => ({ room, issues: eligibility(state, family, room) }))
-    .sort((a, b) => {
-      const ae = a.issues.length === 0 ? 0 : 1;
-      const be = b.issues.length === 0 ? 0 : 1;
-      if (ae !== be) return ae - be;
-      const am = a.room.accessible === family.needsAccessible ? 0 : 1;
-      const bm = b.room.accessible === family.needsAccessible ? 0 : 1;
-      if (am !== bm) return am - bm;
-      return roomBuckets(state, b.room.id).allocatable - roomBuckets(state, a.room.id).allocatable;
-    });
-}
-
-/** 单条承诺当前是否仍能按家庭整组兑现 */
-export function promiseIssues(state: ShelterState, p: ReturnPromise): string[] {
-  const fam = familyById(state, p.familyId);
-  const room = state.rooms.find((r) => r.id === p.roomId);
-  if (!room) return ['保护房间不存在'];
-  const issues: string[] = [];
-  if (room.status !== 'open') issues.push(`保护房间${room.name}已临时关闭`);
-  if (fam.needsAccessible && !room.accessible)
-    issues.push(`${fam.name}需要无障碍设施，${room.name}不具备`);
-  const others = new Set<string>();
-  for (const f of state.families) {
-    if (f.status === 'checked_in' && f.currentRoomId === room.id && f.id !== fam.id) others.add(f.id);
-  }
-  for (const q of state.promises) {
-    if (q.id !== p.id && q.roomId === room.id && (q.status === 'active' || q.status === 'expired_contact'))
-      others.add(q.familyId);
-  }
-  for (const a of state.assignments) {
-    if (a.roomId === room.id && a.status === 'confirming' && a.familyId !== fam.id) others.add(a.familyId);
-  }
-  if (others.size > 0) {
-    if (!fam.coRoomConsent) issues.push(`${fam.name}未同意共房`);
-    for (const oid of others) {
-      const of = state.families.find((f) => f.id === oid);
-      if (of && !of.coRoomConsent) issues.push(`${room.name}内「${of.name}」未同意共房`);
-    }
-  }
-  const b = roomBuckets(state, room.id);
-  if (b.present + b.confirming + b.protected > room.capacity) issues.push(`${room.name}容量被突破`);
-  return issues;
-}
+// ---------------------------------------------------------------------------
+// 全柜核对（不变量）
+// ---------------------------------------------------------------------------
 
 export interface InvariantResult {
   name: string;
@@ -251,87 +333,192 @@ export interface InvariantResult {
   detail: string;
 }
 
-/** 全所核对：家庭唯一位置、容量、承诺可兑现、人数口径一致、不自动搬动 */
-export function checkInvariants(state: ShelterState): InvariantResult[] {
+export function checkInvariants(state: BeddingState): InvariantResult[] {
   const results: InvariantResult[] = [];
 
-  const locBad: string[] = [];
+  // 1. 包含树合法：单父、不成环、根⇔有位置、父必为包
+  const treeBad: string[] = [];
+  for (const n of state.nodes) {
+    if (n.parentId === null && !n.holder) treeBad.push(`${n.label}:根节点无位置`);
+    if (n.parentId !== null && n.holder) treeBad.push(`${n.label}:子件却持有位置`);
+    if (n.parentId) {
+      const p = state.nodes.find((x) => x.id === n.parentId);
+      if (!p) treeBad.push(`${n.label}:父包不存在`);
+      else if (p.kind !== 'pack') treeBad.push(`${n.label}:父节点${p.label}不是包`);
+    }
+    try {
+      rootOf(state, n.id);
+    } catch (e) {
+      treeBad.push(`${n.label}:${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  results.push({
+    name: '包含树合法（单父·不成环·根持位置）',
+    ok: treeBad.length === 0,
+    detail: treeBad.join('；') || '每件物资至多一个当前父包，包含关系无环，位置只挂在根上',
+  });
+
+  // 2. 封签与组成：封签完好的包组成合规（一人套=1垫1毯；四人包=4个一人套）
+  const sealBad: string[] = [];
+  for (const p of state.nodes.filter((n) => n.kind === 'pack' && n.seal)) {
+    const ch = childrenOf(state, p.id);
+    if (p.packKind === 'one_set') {
+      const mats = ch.filter((c) => c.kind === 'mat').length;
+      const blankets = ch.filter((c) => c.kind === 'blanket').length;
+      if (ch.length !== 2 || mats !== 1 || blankets !== 1)
+        sealBad.push(`${p.label}:一人套应为1垫1毯，实际${ch.length}件`);
+    } else if (p.packKind === 'four_pack') {
+      if (ch.length !== 4 || ch.some((c) => c.packKind !== 'one_set'))
+        sealBad.push(`${p.label}:四人包应为4个一人套`);
+    } else if (ch.length === 0) sealBad.push(`${p.label}:重封包为空`);
+  }
+  results.push({
+    name: '封签完好 ⇒ 组成合规',
+    ok: sealBad.length === 0,
+    detail: sealBad.join('；') || '一人套=1垫1毯、四人包=4个一人套；成套只覆盖其内部物资',
+  });
+
+  // 3. 叶件计数守恒：五态互斥且合计等于总叶件
+  const leaves = state.nodes.filter(isLeaf);
+  const cnt: Record<ItemStatus, number> = { available: 0, in_pack: 0, delivered: 0, cleaning: 0, damaged: 0 };
+  for (const l of leaves) cnt[effectiveStatus(state, l)]++;
+  const sum = cnt.available + cnt.in_pack + cnt.delivered + cnt.cleaning + cnt.damaged;
+  results.push({
+    name: '物资数量按叶件算（五态守恒）',
+    ok: sum === leaves.length,
+    detail: `总叶件${leaves.length}＝可用${cnt.available}＋包内${cnt.in_pack}＋已交付${cnt.delivered}＋待清洁${cnt.cleaning}＋报损${cnt.damaged}（包壳不计寝具）`,
+  });
+
+  // 4. 需求与凭证一致：凭证份数=需求人数；已核销=已覆盖人数
+  const vBad: string[] = [];
+  let needTotal = 0;
+  let coveredTotal = 0;
   for (const f of state.families) {
-    const activeAssign = state.assignments.filter(
-      (a) => a.familyId === f.id && (a.status === 'active' || a.status === 'confirming'),
-    );
-    const activeProm = state.promises.filter(
-      (p) => p.familyId === f.id && (p.status === 'active' || p.status === 'expired_contact'),
-    );
-    if (f.status === 'checked_in' && activeAssign.length !== 1)
-      locBad.push(`${f.name}:在住但有效入住记录=${activeAssign.length}`);
-    if (f.status === 'confirming' && activeAssign.length !== 1)
-      locBad.push(`${f.name}:确认中但记录=${activeAssign.length}`);
-    if (f.status === 'temp_leave' && activeProm.length !== 1)
-      locBad.push(`${f.name}:暂离但有效承诺=${activeProm.length}`);
-    if (f.status === 'temp_leave' && activeAssign.length > 0)
-      locBad.push(`${f.name}:暂离却仍有入住记录`);
-    if ((f.status === 'checked_in' || f.status === 'confirming') && activeProm.length > 0)
-      locBad.push(`${f.name}:在场却仍有返所承诺`);
-    if (
-      (f.status === 'registered' || f.status === 'draft' || f.status === 'checked_out') &&
-      (activeAssign.length > 0 || activeProm.length > 0)
-    )
-      locBad.push(`${f.name}:${FAMILY_STATUS_LABEL[f.status]}却仍有床位记录`);
+    const needs = needsOf(state, f.id);
+    const covered = needs.filter(fullyCovered).length;
+    needTotal += needs.length;
+    coveredTotal += covered;
+    const v = voucherOf(state, f.id);
+    if (!v) {
+      vBad.push(`${f.name}:无领取凭证`);
+      continue;
+    }
+    if (v.portions !== needs.length) vBad.push(`${f.name}:凭证${v.portions}份≠需求${needs.length}人`);
+    if (v.consumed !== covered) vBad.push(`${f.name}:已核销${v.consumed}≠已覆盖${covered}人`);
+    if (v.consumed > v.portions) vBad.push(`${f.name}:核销超过份数`);
   }
   results.push({
-    name: '家庭唯一位置',
-    ok: locBad.length === 0,
-    detail: locBad.join('；') || '每个家庭在任一时刻只有一个确定位置（在住房间 / 暂离承诺 / 待安置）',
+    name: '需求覆盖按人算（凭证一致）',
+    ok: vBad.length === 0,
+    detail: vBad.join('；') || `总需求${needTotal}人，已覆盖${coveredTotal}人；各家庭凭证份数=人数、已核销=已覆盖`,
   });
 
-  const capBad = state.rooms
-    .map((r) => ({ r, b: roomBuckets(state, r.id) }))
-    .filter((x) => x.b.present + x.b.confirming + x.b.protected > x.r.capacity)
-    .map(
-      (x) =>
-        `${x.r.name}: 在场${x.b.present}+确认中${x.b.confirming}+保护${x.b.protected} > 容量${x.r.capacity}`,
-    );
-  results.push({
-    name: '房间容量不被突破',
-    ok: capBad.length === 0,
-    detail: capBad.join('；') || '所有房间：在场 + 确认中 + 保护中 ≤ 容量',
-  });
-
-  const promBad: string[] = [];
-  for (const p of state.promises) {
-    if (p.status !== 'active' && p.status !== 'expired_contact') continue;
-    const iss = promiseIssues(state, p);
-    if (iss.length) promBad.push(`${familyById(state, p.familyId).name}: ${iss.join('、')}`);
+  // 5. 交付归属：已交付叶件的根都挂有效交付单；交付单引用的物资存在
+  const dBad: string[] = [];
+  for (const l of leaves) {
+    if (effectiveStatus(state, l) !== 'delivered') continue;
+    const root = rootOf(state, l.id);
+    const h = root.holder as Extract<NonNullable<ItemNode['holder']>, { type: 'delivered' }>;
+    const d = deliveryById(state, h.deliveryId);
+    if (!d) dBad.push(`${l.label}:交付单${h.deliveryId}不存在`);
+    else if (!d.leafItemIds.includes(l.id)) dBad.push(`${l.label}:不在交付单${d.id}的物资清单内`);
+  }
+  for (const d of state.deliveries) {
+    for (const id of d.leafItemIds) if (!state.nodes.some((n) => n.id === id)) dBad.push(`交付单${d.id}:物资不存在`);
   }
   results.push({
-    name: '返所承诺可按家庭整组兑现',
-    ok: promBad.length === 0,
-    detail: promBad.join('；') || '全部有效承诺的保护容量完整、房间资格满足',
+    name: '已交付可查到原交付单',
+    ok: dBad.length === 0,
+    detail: dBad.join('；') || '每件已交付物资都能解析到唯一交付单（响应丢失查原交付，不再领一次）',
   });
 
-  const byFam = state.families.filter((f) => f.status === 'checked_in').reduce((s, f) => s + f.size, 0);
-  const byRoom = state.rooms.reduce((s, r) => s + roomBuckets(state, r.id).present, 0);
+  // 6. 待返还与补领：旧物待退回标记一致；同一需求同一品类无重复在办补领
+  const rBad: string[] = [];
+  for (const p of state.pendingReturns) {
+    if (p.matsReturned > p.matsOwed || p.blanketsReturned > p.blanketsOwed)
+      rBad.push(`${p.id}:退回数超过应返数`);
+    if (p.status === 'closed' && (p.matsReturned !== p.matsOwed || p.blanketsReturned !== p.blanketsOwed))
+      rBad.push(`${p.id}:已清讫但数目不符`);
+  }
+  const openKey = new Set<string>();
+  for (const r of state.reclaims) {
+    if (r.status !== 'awaiting_old') continue;
+    const key = `${r.needId}:${r.itemType}`;
+    if (openKey.has(key)) rBad.push(`需求${r.needId}存在重复在办补领`);
+    openKey.add(key);
+    const old = state.nodes.find((n) => n.id === r.oldItemId);
+    if (!old?.awaitingReturn) rBad.push(`补领${r.id}:旧件未标记待退回`);
+    if (old && effectiveStatus(state, old) !== 'delivered')
+      rBad.push(`补领${r.id}:旧件未实际退回却已离开已交付态（申请≠已回）`);
+  }
   results.push({
-    name: '实际在场人数一致',
-    ok: byFam === byRoom,
-    detail: `家庭口径 ${byFam} 人 ＝ 房间口径 ${byRoom} 人`,
-  });
-
-  const moveBad = state.families
-    .filter((f) => f.status === 'checked_in')
-    .filter((f) => {
-      const a = state.assignments.find((x) => x.familyId === f.id && x.status === 'active');
-      return !a || a.roomId !== f.currentRoomId;
-    })
-    .map((f) => f.name);
-  results.push({
-    name: '已入住家庭未被自动搬动',
-    ok: moveBad.length === 0,
-    detail: moveBad.length ? `异常：${moveBad.join('、')}` : '在住家庭的入住记录与其房间一致，系统不做自动搬动',
+    name: '待返还 / 补领旧物核对',
+    ok: rBad.length === 0,
+    detail:
+      rBad.join('；') ||
+      '待返还数目与实收一致；在办补领的旧件均标记待退回且仍未离开已交付态（未实际退回不入清洁/报损）',
   });
 
   return results;
+}
+
+/** 库存统计（叶件口径，UI 用） */
+export interface CounterStats {
+  totalMats: number;
+  totalBlankets: number;
+  byStatus: Record<ItemStatus, { mats: number; blankets: number }>;
+  warehouse: { looseMats: number; looseBlankets: number; inPackMats: number; inPackBlankets: number };
+  counter: { looseMats: number; looseBlankets: number; inPackMats: number; inPackBlankets: number };
+  needsTotal: number;
+  needsCovered: number;
+  portionsTotal: number;
+  portionsConsumed: number;
+}
+
+export function counterStats(state: BeddingState): CounterStats {
+  const leaves = state.nodes.filter(isLeaf);
+  const byStatus: CounterStats['byStatus'] = {
+    available: { mats: 0, blankets: 0 },
+    in_pack: { mats: 0, blankets: 0 },
+    delivered: { mats: 0, blankets: 0 },
+    cleaning: { mats: 0, blankets: 0 },
+    damaged: { mats: 0, blankets: 0 },
+  };
+  const wh = { looseMats: 0, looseBlankets: 0, inPackMats: 0, inPackBlankets: 0 };
+  const ct = { looseMats: 0, looseBlankets: 0, inPackMats: 0, inPackBlankets: 0 };
+  for (const l of leaves) {
+    const st = effectiveStatus(state, l);
+    if (l.kind === 'mat') byStatus[st].mats++;
+    else byStatus[st].blankets++;
+    const root = rootOf(state, l.id);
+    const loc = root.holder!.type;
+    if (loc === 'warehouse' || loc === 'counter') {
+      const bucket = loc === 'warehouse' ? wh : ct;
+      const inPack = !!l.parentId;
+      if (l.kind === 'mat') {
+        if (inPack) bucket.inPackMats++;
+        else bucket.looseMats++;
+      } else {
+        if (inPack) bucket.inPackBlankets++;
+        else bucket.looseBlankets++;
+      }
+    }
+  }
+  const needsTotal = state.needs.length;
+  const needsCovered = state.needs.filter(fullyCovered).length;
+  const portionsTotal = state.vouchers.reduce((s, v) => s + v.portions, 0);
+  const portionsConsumed = state.vouchers.reduce((s, v) => s + v.consumed, 0);
+  return {
+    totalMats: leaves.filter((l) => l.kind === 'mat').length,
+    totalBlankets: leaves.filter((l) => l.kind === 'blanket').length,
+    byStatus,
+    warehouse: wh,
+    counter: ct,
+    needsTotal,
+    needsCovered,
+    portionsTotal,
+    portionsConsumed,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -344,14 +531,14 @@ function uid(): string {
     : `id-${Math.random().toString(36).slice(2)}`;
 }
 
-function clone(s: ShelterState): ShelterState {
+function clone(s: BeddingState): BeddingState {
   return structuredClone(s);
 }
 
 type ReceiptSink = (kind: string, summary: string, lines?: string[], extra?: Partial<Receipt>) => Receipt;
 
 function addReceipt(
-  state: ShelterState,
+  state: BeddingState,
   kind: string,
   actor: string,
   summary: string,
@@ -361,46 +548,41 @@ function addReceipt(
   const seq = ++state.seqCounter;
   const r: Receipt = { seq, id: `R${seq}`, at: state.virtualNow, kind, actor, summary, lines, ...extra };
   state.receipts.push(r);
-  if (state.receipts.length > 500) state.receipts.splice(0, state.receipts.length - 500);
+  if (state.receipts.length > 600) state.receipts.splice(0, state.receipts.length - 600);
   return r;
 }
 
-function summarize(state: ShelterState, cmd: Command): string {
+function summarize(state: BeddingState, cmd: Command): string {
   const famName = (id: string) => state.families.find((f) => f.id === id)?.name ?? id;
-  const roomName = (id: string) => state.rooms.find((r) => r.id === id)?.name ?? id;
   switch (cmd.type) {
     case 'RegisterFamily':
       return `登记家庭「${cmd.input.name}」`;
-    case 'CreateDraft':
-      return `草稿分房 ${famName(cmd.familyId)} → ${roomName(cmd.roomId)}`;
-    case 'CancelDraft':
-      return '取消草稿';
-    case 'SubmitCheckIn':
-      return '提交入住确认';
-    case 'RegisterLeave':
-      return `暂离登记 ${famName(cmd.familyId)}`;
-    case 'ConfirmReturn':
-      return `返所确认 ${famName(cmd.familyId)}`;
-    case 'ExtendPromise':
-      return `承诺延期 ${famName(cmd.familyId)}`;
-    case 'SubmitCheckout':
-      return `核实退住 ${famName(cmd.familyId)}`;
-    case 'AddTaskNote':
-      return '联系任务备注';
-    case 'CloseRoom':
-      return `临时关闭房间 ${roomName(cmd.roomId)}`;
-    case 'ReopenRoom':
-      return `重开房间 ${roomName(cmd.roomId)}`;
+    case 'SplitFamily':
+      return `家庭拆分 ${famName(cmd.familyId)}`;
+    case 'SealPack':
+      return `封包（${PACK_KIND_LABEL[cmd.packKind]}）`;
+    case 'OpenPack':
+      return '开封';
+    case 'DetachChild':
+      return '包内取件';
+    case 'MoveStock':
+      return cmd.to === 'counter' ? '送到领取柜' : '送回库房';
+    case 'Deliver':
+      return `交付 ${famName(cmd.familyId)}`;
+    case 'ReceiveReturn':
+      return `退回接收 ${famName(cmd.familyId)}`;
+    case 'Reclaim':
+      return `补领 ${famName(cmd.familyId)}`;
+    case 'CompleteCleaning':
+      return '完成清洁';
     case 'AdvanceClock':
       return '推进演示时间';
     case 'ResetDemo':
       return '重置演示数据';
-    case 'FinalizeDue':
-      return '异步确认结算';
   }
 }
 
-export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): CmdOutcome {
+export function applyCommand(prev: BeddingState, cmd: Command, ctx: CmdCtx): CmdOutcome {
   if (cmd.type === 'ResetDemo') {
     const fresh = seedState();
     const r = addReceipt(fresh, 'reset', ROLE_LABEL[ctx.role], '演示数据已重置为初始场景', []);
@@ -432,9 +614,6 @@ export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): Cmd
   };
 
   const error = dispatch(state, cmd, ctx, R);
-  // 每次变更后重核所有有效草稿：失效草稿保留输入并说明冲突
-  revalidateDrafts(state, R);
-
   const mutated = receipts.length > 0 || !!error;
   if (!mutated) return { state: prev, receipts: [], changed: false };
 
@@ -450,7 +629,7 @@ export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): Cmd
   return { state, receipts, error, changed: true };
 }
 
-function dispatch(state: ShelterState, cmd: Command, ctx: CmdCtx, R: ReceiptSink): string | undefined {
+function dispatch(state: BeddingState, cmd: Command, ctx: CmdCtx, R: ReceiptSink): string | undefined {
   const perm = PERMS[cmd.type];
   if (perm !== 'any' && !perm.includes(ctx.role)) {
     return `当前角色（${ROLE_LABEL[ctx.role]}）无权执行此操作，需要：${perm.map((r) => ROLE_LABEL[r]).join('或')}`;
@@ -458,510 +637,596 @@ function dispatch(state: ShelterState, cmd: Command, ctx: CmdCtx, R: ReceiptSink
   switch (cmd.type) {
     case 'RegisterFamily':
       return hRegisterFamily(state, cmd, R);
-    case 'CreateDraft':
-      return hCreateDraft(state, cmd, R);
-    case 'CancelDraft':
-      return hCancelDraft(state, cmd, R);
-    case 'SubmitCheckIn':
-      return hSubmitCheckIn(state, cmd, ctx, R);
-    case 'RegisterLeave':
-      return hRegisterLeave(state, cmd, R);
-    case 'ConfirmReturn':
-      return hConfirmReturn(state, cmd, R);
-    case 'ExtendPromise':
-      return hExtendPromise(state, cmd, R);
-    case 'SubmitCheckout':
-      return hSubmitCheckout(state, cmd, ctx, R);
-    case 'AddTaskNote':
-      return hAddTaskNote(state, cmd, R);
-    case 'CloseRoom':
-      return hCloseRoom(state, cmd, R);
-    case 'ReopenRoom':
-      return hReopenRoom(state, cmd, R);
+    case 'SplitFamily':
+      return hSplitFamily(state, cmd, R);
+    case 'SealPack':
+      return hSealPack(state, cmd, ctx, R);
+    case 'OpenPack':
+      return hOpenPack(state, cmd, ctx, R);
+    case 'DetachChild':
+      return hDetachChild(state, cmd, R);
+    case 'MoveStock':
+      return hMoveStock(state, cmd, R);
+    case 'Deliver':
+      return hDeliver(state, cmd, R);
+    case 'ReceiveReturn':
+      return hReceiveReturn(state, cmd, R);
+    case 'Reclaim':
+      return hReclaim(state, cmd, R);
+    case 'CompleteCleaning':
+      return hCompleteCleaning(state, cmd, R);
     case 'AdvanceClock':
       return hAdvanceClock(state, cmd, R);
-    case 'FinalizeDue':
-      return hFinalizeDue(state, ctx, R);
     default:
       return '未知命令';
   }
 }
 
 // ---------------------------------------------------------------------------
-// 各命令处理器：返回错误文案（可能已附带状态变更，如草稿失效标记），undefined 表示成功
+// 各命令处理器：返回错误文案，undefined 表示成功
 // ---------------------------------------------------------------------------
 
 function hRegisterFamily(
-  state: ShelterState,
+  state: BeddingState,
   cmd: Extract<Command, { type: 'RegisterFamily' }>,
   R: ReceiptSink,
 ): string | undefined {
-  const { name, size, needsAccessible, coRoomConsent, consentRoomChange } = cmd.input;
-  if (!name.trim()) return '家庭名称不能为空';
-  if (!Number.isInteger(size) || size < 1 || size > 20) return '家庭人数须为 1-20 的整数';
-  const fam: Family = {
-    id: uid(),
-    name: name.trim(),
-    size,
-    needsAccessible,
-    coRoomConsent,
-    consentRoomChange,
-    status: 'registered',
-  };
+  const name = cmd.input.name.trim();
+  const members = cmd.input.memberNames.map((s) => s.trim()).filter(Boolean);
+  if (!name) return '家庭名称不能为空';
+  if (members.length < 1 || members.length > 20) return '住宿人员须为 1-20 人';
+  if (new Set(members).size !== members.length) return '住宿人员姓名不能重复';
+  const batch = state.batches[0];
+  const fam: Family = { id: uid(), name, batchId: batch.id, createdAt: state.virtualNow };
   state.families.push(fam);
-  R('family_registered', `已登记：${fam.name}（${fam.size}人）`, [
-    `无障碍需求：${needsAccessible ? '需要' : '不需要'}；共房：${coRoomConsent ? '同意' : '不同意'}；返所换房：${consentRoomChange ? '同意' : '不同意'}`,
-    '家庭已加入待安置列表，可创建分房草稿（草稿不占正式床位）',
+  for (const personName of members) {
+    state.needs.push({
+      id: uid(),
+      batchId: batch.id,
+      familyId: fam.id,
+      personName,
+      matItemId: null,
+      blanketItemId: null,
+      createdAt: state.virtualNow,
+    });
+  }
+  state.vouchers.push({
+    id: uid(),
+    familyId: fam.id,
+    batchId: batch.id,
+    portions: members.length,
+    consumed: 0,
+  });
+  R('family_registered', `已登记：${name}（${members.length}人，${batch.name}）`, [
+    `人员需求（一人一垫一毯）：${members.join('、')}`,
+    `开具领取凭证 ${members.length} 人份；需求与人绑定、与家庭归属分开`,
   ]);
   return undefined;
 }
 
-function hCreateDraft(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CreateDraft' }>,
+function hSplitFamily(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'SplitFamily' }>,
   R: ReceiptSink,
 ): string | undefined {
   const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'registered')
-    return `当前状态（${FAMILY_STATUS_LABEL[fam.status]}）不能创建分房草稿`;
-  if (openDraftOf(state, fam.id)) return '该家庭已存在未处理的草稿';
-  const room = roomById(state, cmd.roomId);
-  const issues = eligibility(state, fam, room);
-  if (issues.length) return `草稿未通过资格核验：${issues.join('；')}`;
-  const a: Assignment = {
+  const newName = cmd.newName.trim();
+  if (!newName) return '新户名称不能为空';
+  const famNeeds = needsOf(state, fam.id);
+  const ids = [...new Set(cmd.needIds)];
+  if (ids.length === 0) return '请选择要迁出的成员';
+  const moved: Need[] = [];
+  for (const id of ids) {
+    const n = state.needs.find((x) => x.id === id);
+    if (!n || n.familyId !== fam.id) return '所选成员不属于该家庭';
+    moved.push(n);
+  }
+  if (moved.length >= famNeeds.length) return '拆分须为原家庭保留至少 1 人（全部迁出不是拆分）';
+  const v = voucherOf(state, fam.id);
+  if (!v) return '原家庭无领取凭证';
+  const newFam: Family = {
     id: uid(),
-    familyId: fam.id,
-    roomId: room.id,
-    beds: fam.size,
-    kind: 'draft',
-    status: 'draft_open',
+    name: newName,
+    batchId: fam.batchId,
+    splitFromId: fam.id,
     createdAt: state.virtualNow,
   };
-  state.assignments.push(a);
-  fam.status = 'draft';
-  R('draft_created', `草稿分房：${fam.name}（${fam.size}人）→ ${room.name}房`, [
-    '草稿不占正式床位，现场入住确认后才计入实际在场人数',
-  ]);
+  state.families.push(newFam);
+  const movedCovered = moved.filter(fullyCovered).length;
+  for (const n of moved) n.familyId = newFam.id;
+  const beforePortions = v.portions;
+  const beforeConsumed = v.consumed;
+  v.portions -= moved.length;
+  v.consumed -= movedCovered;
+  state.vouchers.push({
+    id: uid(),
+    familyId: newFam.id,
+    batchId: fam.batchId,
+    portions: moved.length,
+    consumed: movedCovered,
+  });
+  const openPr = openPendingReturnsOf(state, fam.id);
+  const openRc = state.reclaims.filter((r) => r.familyId === fam.id && r.status === 'awaiting_old');
+  const lines = [
+    `需求随人转移（需求单号不变、已覆盖关系不变）：${moved.map((n) => n.personName).join('、')}`,
+    `领取权转移而非新增：凭证 ${beforePortions} 份 → 原户 ${v.portions} 份 ＋ 新户 ${moved.length} 份（合计不变，不重新生成领取权）`,
+    `已核销随覆盖转移：${beforeConsumed} → ${v.consumed} ＋ ${movedCovered}`,
+  ];
+  if (openPr.length || openRc.length)
+    lines.push('注意：待返还与在办补领义务仍记在原家庭名下（按交付发生时的归属核算）');
+  R('family_split', `家庭拆分：${fam.name} → 「${fam.name}」${v.portions}人 ＋ 「${newName}」${moved.length}人`, lines);
   return undefined;
 }
 
-function hCancelDraft(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CancelDraft' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const a = state.assignments.find((x) => x.id === cmd.assignmentId);
-  if (!a || (a.status !== 'draft_open' && a.status !== 'draft_stale')) return '草稿不存在或已不可取消';
-  const fam = familyById(state, a.familyId);
-  a.status = 'draft_cancelled';
-  if (fam.status === 'draft') fam.status = 'registered';
-  R('draft_cancelled', `草稿已取消：${fam.name}`, []);
-  return undefined;
+/** 解析封包材料：根（可用）或已开封包内的直接子件（自动取出） */
+function resolveSealChildren(
+  state: BeddingState,
+  childIds: string[],
+): { children?: ItemNode[]; error?: string } {
+  const ids = [...new Set(childIds)];
+  if (ids.length === 0) return { error: '请选择封包材料' };
+  const children: ItemNode[] = [];
+  let location: 'warehouse' | 'counter' | null = null;
+  for (const id of ids) {
+    const n = state.nodes.find((x) => x.id === id);
+    if (!n) return { error: `物资不存在: ${id}` };
+    if (n.kind === 'pack' && !n.seal) return { error: `包 ${n.label} 已开封，空包壳不能作为封包内容（包壳不计寝具）` };
+    let rootHolder: NonNullable<ItemNode['holder']>;
+    if (n.parentId === null) {
+      if (!n.holder) return { error: `物资 ${n.label} 状态异常` };
+      rootHolder = n.holder;
+    } else {
+      const parent = state.nodes.find((p) => p.id === n.parentId);
+      if (!parent) return { error: `物资 ${n.label} 的父包不存在` };
+      if (parent.seal) return { error: `物资 ${n.label} 在已封包 ${parent.label} 内，须先开封` };
+      const root = rootOf(state, n.id);
+      if (!root.holder) return { error: `物资 ${n.label} 状态异常` };
+      rootHolder = root.holder;
+    }
+    if (rootHolder.type === 'delivered') return { error: `物资 ${n.label} 已交付，不能封包` };
+    if (rootHolder.type === 'cleaning') return { error: `物资 ${n.label} 在待清洁区，不能封包` };
+    if (rootHolder.type === 'damaged') return { error: `物资 ${n.label} 已报损，不能封包` };
+    if (location && location !== rootHolder.type)
+      return { error: '封包材料须在同一地点（同在库房或同在领取柜）' };
+    location = rootHolder.type;
+    children.push(n);
+  }
+  return { children };
 }
 
-function hSubmitCheckIn(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'SubmitCheckIn' }>,
+function hSealPack(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'SealPack' }>,
   ctx: CmdCtx,
   R: ReceiptSink,
 ): string | undefined {
-  const a = state.assignments.find((x) => x.id === cmd.assignmentId);
-  if (!a) return '草稿不存在';
-  const fam = familyById(state, a.familyId);
-  if (a.status === 'draft_stale')
-    return `草稿已失效：${a.conflictReason ?? ''}。原输入已保留在失效草稿中，可修改后重新创建。`;
-  if (a.status !== 'draft_open') return '该草稿当前状态不能提交入住确认';
-  const room = roomById(state, a.roomId);
-  // 提交时在事务内重新核对房间资格（并发下另一标签可能已先占床）
-  const issues = eligibility(state, fam, room);
-  if (issues.length) {
-    a.status = 'draft_stale';
-    a.conflictReason = issues.join('；');
-    if (fam.status === 'draft') fam.status = 'registered';
-    R('draft_stale', `草稿失效：${fam.name} → ${room.name}房`, [
-      `冲突原因：${a.conflictReason}`,
-      '草稿输入已保留，可在床位变化后重试或改房',
-    ]);
-    return `提交时事务重核未通过：${a.conflictReason}`;
+  const { children, error } = resolveSealChildren(state, cmd.childIds);
+  if (error) return error;
+  const kids = children!;
+  // 组成核验：成套只覆盖其内部物资
+  if (cmd.packKind === 'one_set') {
+    const mats = kids.filter((k) => k.kind === 'mat').length;
+    const blankets = kids.filter((k) => k.kind === 'blanket').length;
+    if (kids.length !== 2 || mats !== 1 || blankets !== 1)
+      return `一人套包须恰好 1 垫 1 毯（当前 ${kids.length} 件：垫${mats}毯${blankets}），不能再额外增加物资`;
+    if (kids.some((k) => !isLeaf(k))) return '一人套包只能装散件叶件（垫、毯各一）';
+  } else if (cmd.packKind === 'four_pack') {
+    if (kids.length !== 4 || kids.some((k) => k.packKind !== 'one_set'))
+      return '四人包须恰好由 4 个一人套包组成';
+  } else {
+    if (kids.length < 1) return '重封包至少装 1 件';
   }
-  a.status = 'confirming';
-  fam.status = 'confirming';
-  state.pending.push({
+  const first = kids[0];
+  const location = (first.parentId ? rootOf(state, first.id).holder : first.holder) as Extract<
+    NonNullable<ItemNode['holder']>,
+    { type: 'warehouse' | 'counter' }
+  >;
+  const seq = ++state.packSeq[cmd.packKind];
+  const label = `${PACK_PREFIX[cmd.packKind]}-${String(seq).padStart(2, '0')}`;
+  const seal = { sealId: `SEAL-${++state.sealSeq}`, sealedAt: state.virtualNow, sealedBy: ROLE_LABEL[ctx.role] };
+  const node: ItemNode = {
     id: uid(),
-    kind: 'checkin',
-    familyId: fam.id,
-    assignmentId: a.id,
-    submittedAtReal: ctx.realNow,
-    resolveAtReal: ctx.realNow + CHECKIN_DELAY_REAL_MS,
-    atVirtual: state.virtualNow,
-    actor: ctx.role,
-  });
+    label,
+    kind: 'pack',
+    packKind: cmd.packKind,
+    parentId: null,
+    holder: { type: location.type },
+    seal,
+    brokenSeals: [],
+    awaitingReturn: false,
+    createdAt: state.virtualNow,
+  };
+  state.nodes.push(node);
+  for (const k of kids) {
+    k.parentId = node.id; // 一件只能有一个当前父包：装入即改挂
+    k.holder = null;
+  }
+  const st = leafStats(state, node.id);
   R(
-    'checkin_submitted',
-    `入住确认已提交：${fam.name}（${fam.size}人）→ ${room.name}房`,
-    ['本地模拟适配器进行异步现场核实（约1秒），完成后才计入实际在场人数；确认中床位已预占'],
-    { pending: true },
+    'pack_sealed',
+    `封包 ${label}（${PACK_KIND_LABEL[cmd.packKind]}，封签 ${seal.sealId}）：${kids.map((k) => k.label).join('、')}`,
+    [
+      `叶件 ${st.leaves}（垫${st.mats} 毯${st.blankets}，${st.portions} 人份）；位置：${location.type === 'counter' ? '领取柜' : '库房'}`,
+      '成套只覆盖其内部物资；包含树模型：子件位置随新根继承',
+    ],
   );
   return undefined;
 }
 
-function hRegisterLeave(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'RegisterLeave' }>,
+function hOpenPack(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'OpenPack' }>,
+  ctx: CmdCtx,
   R: ReceiptSink,
 ): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'checked_in') return '仅在场在住家庭可登记暂离';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实进行中，不能登记暂离';
-  if (cmd.expectedReturnAt <= state.virtualNow) return '预计返所时间须晚于当前演示时间';
-  const originRoom = roomById(state, fam.currentRoomId!);
-  const endActive = (reason: string) => {
-    const a = state.assignments.find((x) => x.familyId === fam.id && x.status === 'active');
-    if (a) {
-      a.status = 'ended';
-      a.endedAt = state.virtualNow;
-      a.endReason = reason;
-    }
-  };
+  const p = state.nodes.find((n) => n.id === cmd.packId);
+  if (!p || p.kind !== 'pack') return '包不存在';
+  if (!p.seal) return `包 ${p.label} 已开封（封签已破）`;
+  // 外层包未开封时，内层包不可拆（跨层拆包须自外而内）
+  const path = packPathOf(state, p.id);
+  const sealedAncestor = path.slice(0, -1).find((a) => a.seal);
+  if (sealedAncestor) return `须先开封外层包 ${sealedAncestor.label}，才能拆 ${p.label}（跨层拆包自外而内）`;
+  const root = path[0];
+  const h = root.holder!;
+  if (h.type === 'delivered') {
+    const d = deliveryById(state, h.deliveryId);
+    const fam = d ? state.families.find((f) => f.id === d.familyId) : undefined;
+    return `包 ${p.label} 已交付给「${fam?.name ?? '?'}」（交付单 ${h.deliveryId}），不能开封；包内物资随交付锁定`;
+  }
+  if (h.type === 'cleaning' || h.type === 'damaged') return `包 ${p.label} 在${h.type === 'cleaning' ? '待清洁' : '报损'}状态，不能开封`;
+  const brokenSeal = p.seal;
+  p.brokenSeals.push({
+    ...brokenSeal,
+    brokenAt: state.virtualNow,
+    brokenBy: ROLE_LABEL[ctx.role],
+    cause: '柜台开封',
+  });
+  p.seal = null;
+  const kids = childrenOf(state, p.id);
+  const st = leafStats(state, p.id);
+  R('pack_opened', `开封 ${p.label}（封签 ${brokenSeal.sealId} 已破）`, [
+    `内含：${kids.map((k) => k.label).join('、') || '（空）'}（叶件 ${st.leaves}：垫${st.mats} 毯${st.blankets}）`,
+    '内容物仍在已开封的包内，可逐件/逐套取出或重新封包；包壳本身不计寝具',
+  ]);
+  return undefined;
+}
 
-  if (cmd.strategy === 'keep_room') {
-    endActive('暂离（原房原床保留）');
-    const p: ReturnPromise = {
-      id: uid(),
+function hDetachChild(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'DetachChild' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const c = state.nodes.find((n) => n.id === cmd.childId);
+  if (!c) return '物资不存在';
+  if (!c.parentId) return `物资 ${c.label} 已在顶层，无需取出`;
+  const parent = nodeById(state, c.parentId);
+  if (parent.seal) return `包 ${parent.label} 封签完好，须先开封才能取件`;
+  const root = rootOf(state, c.id);
+  const h = root.holder!;
+  if (h.type === 'delivered') return `包 ${parent.label} 已交付，包内物资随交付锁定，不能取件`;
+  if (h.type === 'cleaning' || h.type === 'damaged') return `包 ${parent.label} 在待清洁/报损状态，不能取件`;
+  c.parentId = null;
+  c.holder = { type: h.type };
+  const st = isLeaf(c) ? null : leafStats(state, c.id);
+  R('child_detached', `取出 ${c.label} ← 包 ${parent.label}`, [
+    st ? `含叶件 ${st.leaves}（垫${st.mats} 毯${st.blankets}）；位置：${h.type === 'counter' ? '领取柜' : '库房'}` : `位置：${h.type === 'counter' ? '领取柜' : '库房'}`,
+  ]);
+  return undefined;
+}
+
+function hMoveStock(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'MoveStock' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const ids = [...new Set(cmd.nodeIds)];
+  if (ids.length === 0) return '请选择要移动的物资';
+  const toLabel = cmd.to === 'counter' ? '领取柜' : '库房';
+  // 先整体核验，再统一改写（避免部分生效）
+  for (const id of ids) {
+    const n = state.nodes.find((x) => x.id === id);
+    if (!n) return `物资不存在: ${id}`;
+    if (n.parentId !== null)
+      return `物资 ${n.label} 在包内，位置随根继承；整包移动请选择其最外层包，或先开封取出`;
+    const h = n.holder!;
+    if (h.type === 'delivered') return `物资 ${n.label} 已交付，不能移动`;
+    if (h.type === 'cleaning') return `物资 ${n.label} 在待清洁区，请先完成清洁`;
+    if (h.type === 'damaged') return `物资 ${n.label} 已报损，不能移动`;
+    if (h.type === cmd.to) return `物资 ${n.label} 已在${toLabel}`;
+  }
+  const lines: string[] = [];
+  const moved: string[] = [];
+  for (const id of ids) {
+    const n = nodeById(state, id);
+    n.holder = { type: cmd.to };
+    const st = leafStats(state, n.id);
+    moved.push(n.label);
+    lines.push(
+      st.leaves > 1
+        ? `整包移动 ${n.label}（叶件 ${st.leaves}：垫${st.mats} 毯${st.blankets}）→ ${toLabel}｜包含树模型：仅更新 1 个根节点位置，${st.leaves} 件物资位置随根继承`
+        : `单件移动 ${n.label} → ${toLabel}`,
+    );
+  }
+  R(cmd.to === 'counter' ? 'moved_counter' : 'moved_warehouse', `移动 ${moved.join('、')} → ${toLabel}`, lines);
+  return undefined;
+}
+
+function hDeliver(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'Deliver' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const fam = state.families.find((f) => f.id === cmd.familyId);
+  if (!fam) return '家庭不存在';
+  const v = voucherOf(state, fam.id);
+  if (!v) return '该家庭无领取凭证';
+  const plan = planDelivery(state, cmd.familyId, cmd.nodeIds);
+  if (plan.errors.length) return plan.errors.join('；');
+  if (v.consumed + plan.newlyCovered.length > v.portions) return '凭证核销将超过份数（内部校验）';
+  const ids = [...new Set(cmd.nodeIds)];
+  const did = `D${state.deliveries.length + 1}-${uid().slice(0, 6)}`;
+  // 原子核销：交付物资 ↔ 领取凭证（同一事务内完成）
+  for (const line of plan.lines) {
+    const need = state.needs.find((n) => n.id === line.need.id)!;
+    if (line.mat) need.matItemId = line.mat.id;
+    if (line.blanket) need.blanketItemId = line.blanket.id;
+  }
+  v.consumed += plan.newlyCovered.length;
+  const leafIds = ids.flatMap((id) => leavesOf(state, id).map((l) => l.id));
+  for (const id of ids) {
+    const n = nodeById(state, id);
+    n.holder = { type: 'delivered', deliveryId: did };
+  }
+  const delivery: Delivery = {
+    id: did,
+    kind: 'normal',
+    familyId: fam.id,
+    batchId: fam.batchId,
+    rootNodeIds: ids,
+    leafItemIds: leafIds,
+    assignments: plan.lines.map((l) => ({
+      needId: l.need.id,
+      matItemId: l.mat?.id,
+      blanketItemId: l.blanket?.id,
+    })),
+    excessMats: plan.excessMats.length,
+    excessBlankets: plan.excessBlankets.length,
+    actor: '',
+    at: state.virtualNow,
+  };
+  state.deliveries.push(delivery);
+  const lines: string[] = [];
+  for (const l of plan.lines) {
+    const parts: string[] = [];
+    if (l.mat) parts.push(`垫 ${l.mat.label}`);
+    else if (l.need.matItemId) parts.push(`垫 ${nodeById(state, l.need.matItemId).label}（此前已发）`);
+    if (l.blanket) parts.push(`毯 ${l.blanket.label}`);
+    else if (l.need.blanketItemId) parts.push(`毯 ${nodeById(state, l.need.blanketItemId).label}（此前已发）`);
+    lines.push(
+      `${l.need.personName}：${parts.join(' ＋ ')}${plan.newlyCovered.includes(l.need) ? '（覆盖）' : '（部分覆盖）'}`,
+    );
+  }
+  lines.push(`凭证核销 ${plan.newlyCovered.length} 人份（${v.consumed}/${v.portions}）`);
+  let pr: PendingReturn | undefined;
+  if (plan.excessMats.length || plan.excessBlankets.length) {
+    pr = {
+      id: `PR${state.pendingReturns.length + 1}`,
       familyId: fam.id,
-      strategy: 'keep_room',
-      roomId: originRoom.id,
-      originRoomId: originRoom.id,
-      beds: fam.size,
-      expectedReturnAt: cmd.expectedReturnAt,
-      status: 'active',
+      deliveryId: did,
+      matsOwed: plan.excessMats.length,
+      blanketsOwed: plan.excessBlankets.length,
+      matsReturned: 0,
+      blanketsReturned: 0,
+      status: 'open',
       createdAt: state.virtualNow,
     };
-    state.promises.push(p);
-    fam.status = 'temp_leave';
-    fam.currentRoomId = undefined;
-    R('leave_registered', `暂离登记：${fam.name}（${fam.size}人）外出，预计 ${fmtTime(cmd.expectedReturnAt)} 返所`, [
-      `原房${originRoom.name}原床保留 ${fam.size} 床（保护中，不参与分配）`,
-      '实际在场人数已减少，但住宿关系未结束，返所权保持有效',
-    ]);
-    return undefined;
-  }
-
-  // 容量保护：家庭须事先同意返所换房
-  if (!fam.consentRoomChange) return '该家庭未事先同意返所换房，不能采用容量保护策略';
-  if (!cmd.protectionRoomId) return '请选择用于返所安排的保护房间';
-  const proom = roomById(state, cmd.protectionRoomId);
-  if (proom.id === originRoom.id) return '容量保护需选择不同房间；如需留在原房请选择「原房原床保留」';
-  const issues = eligibility(state, fam, proom);
-  if (issues.length) return `保护房间资格核验未通过：${issues.join('；')}`;
-  endActive('暂离（容量保护，释放原房）');
-  const p: ReturnPromise = {
-    id: uid(),
-    familyId: fam.id,
-    strategy: 'capacity',
-    roomId: proom.id,
-    originRoomId: originRoom.id,
-    beds: fam.size,
-    expectedReturnAt: cmd.expectedReturnAt,
-    status: 'active',
-    createdAt: state.virtualNow,
-  };
-  state.promises.push(p);
-  fam.status = 'temp_leave';
-  fam.currentRoomId = undefined;
-  R('leave_registered', `暂离登记：${fam.name}（${fam.size}人）外出，预计 ${fmtTime(cmd.expectedReturnAt)} 返所`, [
-    `家庭已同意返所换房：原${originRoom.name}房床位已释放，已在${proom.name}房保护 ${fam.size} 床作为返所安排`,
-    `返所时将安排至${proom.name}房，须向返所家庭说明新房`,
-  ]);
-  return undefined;
-}
-
-function hConfirmReturn(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ConfirmReturn' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'temp_leave') return '家庭不处于暂离状态';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实进行中，无法办理返所';
-  const p = activePromiseOf(state, fam.id);
-  if (!p) return '无有效返所承诺（可能已被核实退住）';
-  const room = roomById(state, p.roomId);
-  if (room.status !== 'open') return `保护房间${room.name}已临时关闭，请先由床位管理员重开或调整保护安排`;
-  const origin = roomById(state, p.originRoomId);
-  state.assignments.push({
-    id: uid(),
-    familyId: fam.id,
-    roomId: room.id,
-    beds: fam.size,
-    kind: 'checkin',
-    status: 'active',
-    createdAt: state.virtualNow,
-    confirmedAt: state.virtualNow,
-  });
-  fam.status = 'checked_in';
-  fam.currentRoomId = room.id;
-  p.status = 'fulfilled';
-  p.fulfilledAt = state.virtualNow;
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = '家庭已返所';
-    task.resolvedAt = state.virtualNow;
-  }
-  const lines =
-    p.strategy === 'capacity'
-      ? [
-          `返所换房说明：原${origin.name}房 → 现${room.name}房（家庭事先已同意返所换房），请向返所家庭说明新房位置`,
-          `保护床位 ${p.beds} 床已转为实际在场`,
-        ]
-      : [`返回原房${room.name}原床 ${p.beds} 床，承诺已兑现`];
-  R('return_confirmed', `返所确认：${fam.name}（${fam.size}人）已回到${room.name}房`, lines);
-  return undefined;
-}
-
-function hExtendPromise(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ExtendPromise' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  const p = activePromiseOf(state, fam.id);
-  if (!p) return '无有效返所承诺';
-  if (cmd.newExpectedReturnAt <= state.virtualNow) return '新的预计返所时间须晚于当前演示时间';
-  const wasExpired = p.status === 'expired_contact';
-  p.expectedReturnAt = cmd.newExpectedReturnAt;
-  p.status = 'active';
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = `已延期至 ${fmtTime(cmd.newExpectedReturnAt)}`;
-    task.resolvedAt = state.virtualNow;
-  }
-  R('promise_extended', `返所承诺已延期：${fam.name} → 预计 ${fmtTime(cmd.newExpectedReturnAt)} 返所`, [
-    wasExpired ? '逾期联系任务已随之解决，床位继续保护' : '床位继续保护',
-  ]);
-  return undefined;
-}
-
-function hSubmitCheckout(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'SubmitCheckout' }>,
-  ctx: CmdCtx,
-  R: ReceiptSink,
-): string | undefined {
-  const fam = familyById(state, cmd.familyId);
-  if (fam.status !== 'checked_in' && fam.status !== 'temp_leave')
-    return '仅在住或暂离家庭可办理退住';
-  if (pendingOf(state, fam.id, 'checkout')) return '退住核实已在进行中';
-  if (pendingOf(state, fam.id, 'checkin')) return '入住确认进行中，无法同时退住';
-  state.pending.push({
-    id: uid(),
-    kind: 'checkout',
-    familyId: fam.id,
-    submittedAtReal: ctx.realNow,
-    resolveAtReal: ctx.realNow + CHECKOUT_DELAY_REAL_MS,
-    atVirtual: state.virtualNow,
-    actor: ctx.role,
-  });
-  R(
-    'checkout_submitted',
-    `退住核实已提交：${fam.name}`,
-    ['楼层值班员核实中（本地模拟适配器异步确认）；核实完成后结束返所权并释放床位'],
-    { pending: true },
-  );
-  return undefined;
-}
-
-function hAddTaskNote(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'AddTaskNote' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const t = state.contactTasks.find((x) => x.id === cmd.taskId);
-  if (!t || t.status !== 'open') return '联系任务不存在或已解决';
-  if (!cmd.note.trim()) return '备注不能为空';
-  t.notes.push(`${fmtDateTime(state.virtualNow)} ${cmd.note.trim()}`);
-  const fam = familyById(state, t.familyId);
-  R('task_note', `联系任务备注：${fam.name}`, [cmd.note.trim()]);
-  return undefined;
-}
-
-function hCloseRoom(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'CloseRoom' }>,
-  R: ReceiptSink,
-): string | undefined {
-  const room = roomById(state, cmd.roomId);
-  if (room.status === 'closed') return '房间已处于关闭状态';
-  const present = state.families.filter((f) => f.status === 'checked_in' && f.currentRoomId === room.id);
-  if (present.length)
-    return `房间${room.name}尚有在场家庭（${present.map((f) => f.name).join('、')}），已入住家庭不得被自动搬走，无法关闭`;
-  const confirming = state.assignments.filter((a) => a.roomId === room.id && a.status === 'confirming');
-  if (confirming.length) return `房间${room.name}有入住确认进行中，无法关闭`;
-  const keepPromises = state.promises.filter(
-    (p) => p.roomId === room.id && (p.status === 'active' || p.status === 'expired_contact') && p.strategy === 'keep_room',
-  );
-  if (keepPromises.length)
-    return `房间${room.name}存在「原房原床」返所承诺（${keepPromises
-      .map((p) => familyById(state, p.familyId).name)
-      .join('、')}），相关家庭未选择换房，关闭将无法兑现返所权`;
-
-  // 容量保护承诺：尝试整组迁移到其他房间（保护可迁移，已入住家庭不可迁移）
-  const capPromises = state.promises.filter(
-    (p) => p.roomId === room.id && (p.status === 'active' || p.status === 'expired_contact') && p.strategy === 'capacity',
-  );
-  const extra: Record<string, number> = {};
-  const moves: { p: ReturnPromise; to: Room }[] = [];
-  for (const p of capPromises) {
-    const fam = familyById(state, p.familyId);
-    const candidates = state.rooms
-      .filter((r) => r.id !== room.id && r.status === 'open')
-      .map((r) => ({ r, issues: eligibility(state, fam, r, extra) }))
-      .filter((x) => x.issues.length === 0)
-      .sort((a, b) => roomBuckets(state, b.r.id).allocatable - roomBuckets(state, a.r.id).allocatable);
-    if (!candidates.length)
-      return `无法关闭：返所承诺无法整组兑现——${fam.name}需${p.beds}床${fam.needsAccessible ? '（需无障碍）' : ''}，其他房间均不满足；房间保持开放`;
-    const to = candidates[0].r;
-    extra[to.id] = (extra[to.id] ?? 0) + p.beds;
-    moves.push({ p, to });
-  }
-  for (const m of moves) m.p.roomId = m.to.id;
-  room.status = 'closed';
-  room.closedReason = cmd.reason || '临时关闭';
-  const lines: string[] = [];
-  for (const m of moves)
+    state.pendingReturns.push(pr);
     lines.push(
-      `返所保护迁移：${familyById(state, m.p.familyId).name} ${m.p.beds}床 → ${m.to.name}房（返所时须向家庭说明新房）`,
+      `超出凭证 ${plan.excessMats.length + plan.excessBlankets.length} 件（垫${plan.excessMats.length} 毯${plan.excessBlankets.length}）→ 已记待返还 ${pr.id}：清点实收且确认为未用后才可重发`,
     );
-  for (const d of state.assignments.filter((a) => a.roomId === room.id && a.status === 'draft_open')) {
-    d.status = 'draft_stale';
-    d.conflictReason = `房间${room.name}已临时关闭`;
-    const f = familyById(state, d.familyId);
-    if (f.status === 'draft') f.status = 'registered';
-    lines.push(`草稿失效：${f.name} → ${room.name}房（输入已保留）`);
   }
-  R('room_closed', `房间${room.name}已临时关闭（${room.closedReason}）`, lines);
+  const nodeLabels = ids.map((id) => nodeById(state, id).label).join('、');
+  const r = R(
+    'delivered',
+    `交付 ${did}：${fam.name} ← ${nodeLabels}（叶件 ${leafIds.length}：垫${plan.mats.length} 毯${plan.blankets.length}）`,
+    lines,
+  );
+  delivery.actor = r.actor;
   return undefined;
 }
 
-function hReopenRoom(
-  state: ShelterState,
-  cmd: Extract<Command, { type: 'ReopenRoom' }>,
+/** 退回时破开祖先封签（家庭开封取件），保证“封签完好 ⇒ 内容未变” */
+function breakAncestorSeals(state: BeddingState, item: ItemNode, byLabel: string, notes: string[]): void {
+  let p = item.parentId ? nodeById(state, item.parentId) : null;
+  while (p) {
+    if (p.seal) {
+      p.brokenSeals.push({
+        ...p.seal,
+        brokenAt: state.virtualNow,
+        brokenBy: byLabel,
+        cause: `退回取出 ${item.label}`,
+      });
+      notes.push(`封签 ${p.seal.sealId}（${p.label}）失效：家庭已开封取件`);
+      p.seal = null;
+    }
+    p = p.parentId ? nodeById(state, p.parentId) : null;
+  }
+}
+
+function hReceiveReturn(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'ReceiveReturn' }>,
   R: ReceiptSink,
 ): string | undefined {
-  const room = roomById(state, cmd.roomId);
-  if (room.status !== 'closed') return '房间未处于关闭状态';
-  room.status = 'open';
-  room.closedReason = undefined;
-  R('room_reopened', `房间${room.name}已重新开放`, ['返所保护不自动迁回，保持当前承诺安排']);
+  const fam = state.families.find((f) => f.id === cmd.familyId);
+  if (!fam) return '家庭不存在';
+  const items = cmd.items;
+  if (items.length === 0) return '请选择要接收的退回物资';
+  const ids = items.map((i) => i.itemId);
+  if (new Set(ids).size !== ids.length) return '退回物资不能重复';
+  // 先整体核验（查原交付），再逐件入账
+  for (const { itemId } of items) {
+    const n = state.nodes.find((x) => x.id === itemId);
+    if (!n) return `物资不存在: ${itemId}`;
+    if (!isLeaf(n)) return `包 ${n.label} 不是寝具叶件，退回请按叶件清点（包壳不计寝具）`;
+    const st = effectiveStatus(state, n.id);
+    if (st !== 'delivered') return `物资 ${n.label} 当前为「${ITEM_STATUS_LABEL[st]}」，不是已交付状态，不能退回`;
+    const d = originalDeliveryOfItem(state, n.id);
+    if (!d) return `物资 ${n.label} 查不到原交付单`;
+    if (d.familyId !== fam.id) {
+      const other = state.families.find((f) => f.id === d.familyId);
+      return `物资 ${n.label} 的原始交付单 ${d.id} 属于「${other?.name ?? '?'}」，不能由「${fam.name}」退回（响应丢失/退回须查原交付）`;
+    }
+  }
+  const lines: string[] = [];
+  const sealNotes: string[] = [];
+  const openPrs = openPendingReturnsOf(state, fam.id).sort((a, b) => a.createdAt - b.createdAt);
+  let closedReclaims = 0;
+  for (const { itemId, condition } of items) {
+    const n = nodeById(state, itemId);
+    breakAncestorSeals(state, n, ROLE_LABEL.counter, sealNotes);
+    n.parentId = null;
+    n.holder =
+      condition === 'unused'
+        ? { type: 'warehouse' }
+        : condition === 'used'
+          ? { type: 'cleaning' }
+          : { type: 'damaged', reason: '退回验收报损' };
+    const dest =
+      condition === 'unused' ? '确认为未用 → 回库（可重发）' : condition === 'used' ? '已使用 → 待清洁' : '报损';
+    lines.push(`${n.label}：${dest}`);
+    if (n.awaitingReturn && n.reclaimId) {
+      n.awaitingReturn = false;
+      const rc = state.reclaims.find((x) => x.id === n.reclaimId);
+      n.reclaimId = undefined;
+      if (rc && rc.status === 'awaiting_old') {
+        rc.status = 'closed';
+        rc.closedAt = state.virtualNow;
+        closedReclaims++;
+        lines.push(`补领 ${rc.id} 旧物已实际退回 → 进入${condition === 'unused' ? '回库' : condition === 'used' ? '待清洁' : '报损'}，补领闭环`);
+      }
+    }
+    // 待返还核销（按叶件品类，先到先销）
+    let remaining = 1;
+    for (const pr of openPrs) {
+      if (pr.status !== 'open' || remaining === 0) continue;
+      if (n.kind === 'mat' && pr.matsReturned < pr.matsOwed) {
+        pr.matsReturned++;
+        remaining--;
+      } else if (n.kind === 'blanket' && pr.blanketsReturned < pr.blanketsOwed) {
+        pr.blanketsReturned++;
+        remaining--;
+      }
+      if (pr.matsReturned === pr.matsOwed && pr.blanketsReturned === pr.blanketsOwed) {
+        pr.status = 'closed';
+        pr.closedAt = state.virtualNow;
+        lines.push(`待返还 ${pr.id} 已清讫（垫${pr.matsOwed} 毯${pr.blanketsOwed} 全部实收）`);
+      }
+    }
+  }
+  const summary = `退回接收（清点实收）：${fam.name} 退回 ${items.length} 件`;
+  R('return_received', summary, [...lines, ...sealNotes]);
+  return undefined;
+}
+
+function hReclaim(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'Reclaim' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const fam = state.families.find((f) => f.id === cmd.familyId);
+  if (!fam) return '家庭不存在';
+  const need = state.needs.find((n) => n.id === cmd.needId);
+  if (!need || need.familyId !== fam.id) return '需求不存在或不属于该家庭';
+  const reason = cmd.reason.trim();
+  if (!reason) return '补领须填写原因';
+  const typeLabel = cmd.itemType === 'mat' ? '垫子' : '毯子';
+  const oldItemId = cmd.itemType === 'mat' ? need.matItemId : need.blanketItemId;
+  if (!oldItemId) return `${need.personName} 的${typeLabel}尚未发放，无需补领，请直接办理领取`;
+  const dup = openReclaimOf(state, need.id, cmd.itemType);
+  if (dup)
+    return `重复补领核对未通过：${need.personName} 的${typeLabel}已有在办补领 ${dup.id}（旧件 ${nodeById(state, dup.oldItemId).label} 待退回），不得重复申请`;
+  const oldItem = nodeById(state, oldItemId);
+  if (effectiveStatus(state, oldItem) !== 'delivered') return `旧件 ${oldItem.label} 不在已交付状态，无法办理补领`;
+  const origDelivery = originalDeliveryOfItem(state, oldItem.id);
+  const rep = state.nodes.find((n) => n.id === cmd.replacementNodeId);
+  if (!rep) return '换发物资不存在';
+  if (!isLeaf(rep) || rep.kind !== cmd.itemType) return `换发物资须为${typeLabel}散件（如需套包请先由仓管开封取件）`;
+  if (rep.parentId !== null) return `换发物资 ${rep.label} 在包内，须先由仓管开封取出`;
+  if (rep.holder?.type !== 'counter') return `换发物资 ${rep.label} 须在领取柜（当前：${locationLabel(state, rep)}）`;
+  const rid = `RC${state.reclaims.length + 1}`;
+  const did = `D${state.deliveries.length + 1}-${uid().slice(0, 6)}`;
+  oldItem.awaitingReturn = true;
+  oldItem.reclaimId = rid;
+  rep.holder = { type: 'delivered', deliveryId: did };
+  if (cmd.itemType === 'mat') need.matItemId = rep.id;
+  else need.blanketItemId = rep.id;
+  const rc: Reclaim = {
+    id: rid,
+    familyId: fam.id,
+    needId: need.id,
+    itemType: cmd.itemType,
+    reason,
+    oldItemId: oldItem.id,
+    newItemId: rep.id,
+    status: 'awaiting_old',
+    createdAt: state.virtualNow,
+    actor: ROLE_LABEL.counter,
+  };
+  state.reclaims.push(rc);
+  state.deliveries.push({
+    id: did,
+    kind: 'reclaim',
+    familyId: fam.id,
+    batchId: fam.batchId,
+    rootNodeIds: [rep.id],
+    leafItemIds: [rep.id],
+    assignments: [{ needId: need.id, ...(cmd.itemType === 'mat' ? { matItemId: rep.id } : { blanketItemId: rep.id }) }],
+    excessMats: 0,
+    excessBlankets: 0,
+    actor: ROLE_LABEL.counter,
+    at: state.virtualNow,
+    reclaimId: rid,
+  });
+  R('reclaim_applied', `补领 ${rid}（原因：${reason}）：${need.personName} ${typeLabel} 旧 ${oldItem.label} → 新 ${rep.label}`, [
+    `查原交付：旧件来自交付单 ${origDelivery?.id ?? '?'}（响应丢失查原交付，不再领一次）`,
+    '旧件已标记「待退回」：实际退回前不得进入清洁或报损（申请提交 ≠ 旧物已回）',
+    '本次为置换补领，不新增核销凭证份数',
+  ]);
+  return undefined;
+}
+
+function hCompleteCleaning(
+  state: BeddingState,
+  cmd: Extract<Command, { type: 'CompleteCleaning' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const ids = [...new Set(cmd.itemIds)];
+  if (ids.length === 0) return '请选择要完成清洁的物资';
+  for (const id of ids) {
+    const n = state.nodes.find((x) => x.id === id);
+    if (!n) return `物资不存在: ${id}`;
+    if (!isLeaf(n)) return `包 ${n.label} 不是寝具叶件`;
+    if (n.parentId !== null) return `物资 ${n.label} 在包内`;
+    if (n.holder?.type !== 'cleaning') return `物资 ${n.label} 不在待清洁区`;
+  }
+  const done: string[] = [];
+  for (const id of ids) {
+    const n = nodeById(state, id);
+    n.holder = { type: 'warehouse' };
+    done.push(n.label);
+  }
+  R('cleaning_done', `完成清洁：${done.join('、')} → 回库（可用）`, ['清洁完成的寝具回到库房可用状态，可再次封包或发放']);
   return undefined;
 }
 
 function hAdvanceClock(
-  state: ShelterState,
+  state: BeddingState,
   cmd: Extract<Command, { type: 'AdvanceClock' }>,
   R: ReceiptSink,
 ): string | undefined {
   if (cmd.toVirtual <= state.virtualNow) return '演示时间只能向前推进';
   state.virtualNow = cmd.toVirtual;
   R('clock_advanced', `演示时间推进至 ${fmtDateTime(cmd.toVirtual)}`, []);
-  // 到期未归：只产生联系核实任务，不自动认定退住，床位继续保护
-  for (const p of state.promises.filter(
-    (x) => x.status === 'active' && x.expectedReturnAt < state.virtualNow,
-  )) {
-    p.status = 'expired_contact';
-    const fam = familyById(state, p.familyId);
-    state.contactTasks.push({
-      id: uid(),
-      familyId: fam.id,
-      promiseId: p.id,
-      createdAt: state.virtualNow,
-      status: 'open',
-      notes: [],
-    });
-    R('promise_expired', `返所承诺到期未归：${fam.name}（约定 ${fmtTime(p.expectedReturnAt)} 返所）`, [
-      '已生成联系核实任务；按规则不自动认定退住，床位继续保护，返所权保持有效',
-    ]);
-  }
   return undefined;
-}
-
-function hFinalizeDue(state: ShelterState, ctx: CmdCtx, R: ReceiptSink): string | undefined {
-  const due = state.pending.filter((p) => p.resolveAtReal <= ctx.realNow);
-  for (const p of due) {
-    state.pending.splice(state.pending.indexOf(p), 1);
-    if (p.kind === 'checkin') finalizeCheckin(state, p, R);
-    else finalizeCheckout(state, p, R);
-  }
-  return undefined;
-}
-
-function finalizeCheckin(state: ShelterState, p: PendingConfirmation, R: ReceiptSink): void {
-  const a = state.assignments.find((x) => x.id === p.assignmentId);
-  if (!a || a.status !== 'confirming') return; // 多标签重复结算的幂等保护
-  const fam = familyById(state, p.familyId);
-  const room = roomById(state, a.roomId);
-  if (room.status !== 'open') {
-    a.status = 'draft_stale';
-    a.conflictReason = `房间${room.name}已临时关闭`;
-    fam.status = 'registered';
-    R('checkin_failed', `入住确认失败：${fam.name} → ${room.name}房`, [
-      `冲突原因：${a.conflictReason}`,
-      '草稿输入已保留，可修改后重试',
-    ]);
-    return;
-  }
-  a.status = 'active';
-  a.confirmedAt = state.virtualNow;
-  fam.status = 'checked_in';
-  fam.currentRoomId = room.id;
-  R('checkin_confirmed', `现场入住确认完成：${fam.name}（${fam.size}人）入住${room.name}房`, [
-    '已计入实际在场人数',
-  ]);
-}
-
-function finalizeCheckout(state: ShelterState, p: PendingConfirmation, R: ReceiptSink): void {
-  const fam = familyById(state, p.familyId);
-  if (fam.status === 'checked_out') return; // 幂等保护
-  const a = state.assignments.find((x) => x.familyId === fam.id && x.status === 'active');
-  if (a) {
-    a.status = 'ended';
-    a.endedAt = state.virtualNow;
-    a.endReason = '核实退住';
-  }
-  const prom = activePromiseOf(state, fam.id);
-  if (prom) {
-    prom.status = 'cancelled';
-    prom.cancelledAt = state.virtualNow;
-  }
-  fam.status = 'checked_out';
-  fam.currentRoomId = undefined;
-  const task = openTaskOf(state, fam.id);
-  if (task) {
-    task.status = 'resolved';
-    task.resolution = '已核实退住';
-    task.resolvedAt = state.virtualNow;
-  }
-  R('checkout_confirmed', `退住核实完成：${fam.name}`, [
-    '返所权已结束，占用/保护床位已释放，住宿关系终止',
-  ]);
-}
-
-/** 每次变更后重核有效草稿：失效的标记冲突原因并保留输入 */
-function revalidateDrafts(state: ShelterState, R: ReceiptSink): void {
-  for (const a of state.assignments.filter((x) => x.status === 'draft_open')) {
-    const fam = familyById(state, a.familyId);
-    const room = roomById(state, a.roomId);
-    const issues = eligibility(state, fam, room);
-    if (issues.length) {
-      a.status = 'draft_stale';
-      a.conflictReason = issues.join('；');
-      if (fam.status === 'draft') fam.status = 'registered';
-      R('draft_stale', `草稿失效：${fam.name} → ${room.name}房`, [
-        `冲突原因：${a.conflictReason}`,
-        '草稿输入已保留，可修改后重试',
-      ]);
-    }
-  }
 }

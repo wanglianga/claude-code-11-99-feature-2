@@ -6,9 +6,10 @@ import { readState, transact } from './store';
  * WebWorker：所有写操作都经过「IndexedDB 事务 + 领域引擎」管线，
  * 计算与持久化均在本地完成，不依赖任何后端。
  *
- * 异步确认（入住确认、退住核实）由本地模拟适配器承担：命令先落库为
- * PendingConfirmation（带真实时间戳的应结算时刻），worker 内的定时清扫
- * 在到期后于新事务中结算。刷新或换标签页后，任一 worker 启动即补结算。
+ * 并发口径：同一站点多标签页的命令在 IndexedDB readwrite 事务上串行，
+ * 后到命令在新事务内基于最新状态重新校验——例如一个标签整包交付某四人包后，
+ * 另一个标签对同包的开封/取件会在事务重核中得到明确冲突结果
+ * （包已交付不能开封；包已开封不能整包交付）。
  */
 
 interface WorkerScope {
@@ -17,7 +18,7 @@ interface WorkerScope {
 }
 const ctx = self as unknown as WorkerScope;
 
-const bc = new BroadcastChannel('shelter-workbench');
+const bc = new BroadcastChannel('bedding-counter');
 
 interface CmdResultView {
   ok: boolean;
@@ -40,20 +41,6 @@ async function handleCmd(cmd: Command, role: Role): Promise<CmdResultView> {
   return { ok: !out.error, error: out.error, receipts: out.receipts, changed: out.changed };
 }
 
-/** 本地模拟适配器：结算到期的异步确认单 */
-async function sweep() {
-  try {
-    const realNow = Date.now();
-    const out = await transact((s) => {
-      const r = applyCommand(s, { type: 'FinalizeDue', commandId: `sweep-${realNow}` }, { role: 'receptionist', realNow });
-      return r.changed ? { state: r.state, out: r } : { out: r };
-    });
-    if (out.changed) bc.postMessage({ type: 'invalidate', version: out.state.version });
-  } catch {
-    // 清扫失败不影响主流程，下一轮重试
-  }
-}
-
 ctx.onmessage = async (e: MessageEvent) => {
   const data = e.data as { reqId: number; kind: string; cmd?: Command; role?: Role };
   const { reqId, kind } = data;
@@ -74,9 +61,3 @@ ctx.onmessage = async (e: MessageEvent) => {
     });
   }
 };
-
-// 启动即补结算（覆盖“中途刷新”场景），之后周期性清扫
-void sweep();
-setInterval(() => {
-  void sweep();
-}, 600);

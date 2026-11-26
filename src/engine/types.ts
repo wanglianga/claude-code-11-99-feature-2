@@ -1,104 +1,160 @@
-/** 领域模型类型定义：避难所入住与返所工作台 */
+/** 领域模型类型定义：夜间寝具柜台（一垫一毯发放、退回、拆包与补领） */
 
-/** 操作角色：接待员 / 楼层值班员 / 床位管理员 */
-export type Role = 'receptionist' | 'duty' | 'bed_manager';
+/** 操作角色：仓管员 / 柜台职员 / 稽核员 */
+export type Role = 'keeper' | 'counter' | 'auditor';
 
-/** 家庭当前状态（唯一位置口径） */
-export type FamilyStatus =
-  | 'registered' // 已登记，待安置（无床位）
-  | 'draft' // 已有分房草稿（草稿不占床位）
-  | 'confirming' // 入住确认中（已预占，尚未计入实际在场）
-  | 'checked_in' // 在场在住
-  | 'temp_leave' // 暂离在外（持有有效返所承诺）
-  | 'checked_out'; // 已退住
+/** 物资节点种类：垫子 / 毯子（叶件），包（容器节点；包壳本身不计寝具） */
+export type NodeKind = 'mat' | 'blanket' | 'pack';
 
-export type RoomStatus = 'open' | 'closed';
+/** 包型：一人套包（1垫1毯）/ 四人包（4个一人套）/ 重封包（开封后重新封装） */
+export type PackKind = 'one_set' | 'four_pack' | 'repack';
 
-export type AssignmentStatus =
-  | 'draft_open' // 草稿有效
-  | 'draft_stale' // 草稿失效（保留输入与冲突原因）
-  | 'draft_cancelled'
-  | 'confirming' // 入住确认中
-  | 'active' // 正式入住
-  | 'ended';
+/**
+ * 根节点位置与状态（内部模型选择：有根包含树）。
+ * 叶件与包的位置一律沿包含树继承自根节点——整包搬运只改根；
+ * 核查单件时沿 parentId 解析祖先。库存五态：可用 / 包内 / 已交付 / 待清洁 / 报损，
+ * 其中「包内」由“根可用且自身有父包”派生，不单独落库。
+ */
+export type Holder =
+  | { type: 'warehouse' } // 库房（可用）
+  | { type: 'counter' } // 领取柜现场（可用）
+  | { type: 'delivered'; deliveryId: string } // 已交付（关联交付单）
+  | { type: 'cleaning' } // 待清洁
+  | { type: 'damaged'; reason: string }; // 报损
 
-export type PromiseStatus =
-  | 'active' // 有效返所承诺
-  | 'fulfilled' // 已兑现（家庭已返所）
-  | 'expired_contact' // 到期未归，联系核实中（不自动退住）
-  | 'cancelled'; // 已取消（核实退住，返所权结束）
+/** 有效封签 */
+export interface Seal {
+  sealId: string;
+  sealedAt: number;
+  sealedBy: string; // 操作者（角色名）
+}
 
-/** 床位保护策略：原房原床保留 / 容量保护（事先同意返所换房） */
-export type ProtectionStrategy = 'keep_room' | 'capacity';
+/** 封签历史（可核查的封装来源） */
+export interface BrokenSeal extends Seal {
+  brokenAt: number;
+  brokenBy: string;
+  cause: string;
+}
 
-export interface Room {
+/**
+ * 包含树节点：叶件（垫/毯）或包。
+ * 不变量：parentId 唯一且不成环；parentId === null ⇔ holder !== null（仅根节点持有位置）。
+ */
+export interface ItemNode {
+  id: string;
+  /** 虚构物资编号：MAT-001 / BLK-001 / SET-01 / PK4-01 / RPK-01 */
+  label: string;
+  kind: NodeKind;
+  packKind?: PackKind;
+  /** 当前父包（一件不能有两个当前父包） */
+  parentId: string | null;
+  /** 仅根节点：位置与状态；子件为 null（位置随根继承） */
+  holder: Holder | null;
+  /** 当前有效封签（仅包；开封后为 null） */
+  seal: Seal | null;
+  /** 已破封签历史 */
+  brokenSeals: BrokenSeal[];
+  /** 补领旧物：待实际退回（实际退回前不得进入清洁或报损） */
+  awaitingReturn: boolean;
+  reclaimId?: string;
+  createdAt: number;
+}
+
+/** 住宿批次 */
+export interface Batch {
   id: string;
   name: string;
-  capacity: number;
-  accessible: boolean;
-  status: RoomStatus;
-  closedReason?: string;
 }
 
 export interface Family {
   id: string;
   name: string;
-  size: number;
-  needsAccessible: boolean;
-  /** 是否同意与其他家庭共房 */
-  coRoomConsent: boolean;
-  /** 是否事先同意返所时换房（容量保护策略的前提） */
-  consentRoomChange: boolean;
-  status: FamilyStatus;
-  /** 在场/确认中时所在房间 */
-  currentRoomId?: string;
+  batchId: string;
+  /** 由拆分产生的家庭记录其来源（审计） */
+  splitFromId?: string;
+  createdAt: number;
 }
 
-export interface Assignment {
+/**
+ * 人员需求：每人每住宿批次一垫一毯。
+ * 需求与人绑定、与家庭归属分开：分房或拆成两户只改 familyId，不重新生成领取权。
+ */
+export interface Need {
+  id: string;
+  batchId: string;
+  familyId: string;
+  personName: string;
+  /** 覆盖该需求的实际物资（叶件） */
+  matItemId: string | null;
+  blanketItemId: string | null;
+  createdAt: number;
+}
+
+/** 领取凭证：按实际住宿人数开具的人份领取权；交付时按实际物资原子核销 */
+export interface Voucher {
   id: string;
   familyId: string;
-  roomId: string;
-  beds: number;
-  kind: 'draft' | 'checkin';
-  status: AssignmentStatus;
-  createdAt: number;
-  confirmedAt?: number;
-  endedAt?: number;
-  endReason?: string;
-  /** 失效草稿的冲突说明（输入保留） */
-  conflictReason?: string;
+  batchId: string;
+  portions: number;
+  consumed: number;
 }
 
-/** 返所承诺：暂离家庭的床位权利 */
-export interface ReturnPromise {
+export interface DeliveryLine {
+  needId: string;
+  matItemId?: string;
+  blanketItemId?: string;
+}
+
+/** 交付单：实际物资与领取凭证的原子核销记录 */
+export interface Delivery {
+  id: string;
+  kind: 'normal' | 'reclaim';
+  familyId: string;
+  batchId: string;
+  /** 交付的根节点（整包或散件） */
+  rootNodeIds: string[];
+  /** 交付的全部叶件 */
+  leafItemIds: string[];
+  assignments: DeliveryLine[];
+  /** 超出凭证的物资（记入待返还） */
+  excessMats: number;
+  excessBlankets: number;
+  actor: string;
+  at: number;
+  reclaimId?: string;
+}
+
+/** 待返还：交付超出凭证人份的物资；清点实收且确认为未用后才可重发 */
+export interface PendingReturn {
   id: string;
   familyId: string;
-  strategy: ProtectionStrategy;
-  /** 保护床位所在房间（keep_room=原房；capacity=保护房） */
-  roomId: string;
-  /** 暂离前所在房间（用于返所换房说明） */
-  originRoomId: string;
-  beds: number;
-  expectedReturnAt: number;
-  status: PromiseStatus;
+  deliveryId: string;
+  matsOwed: number;
+  blanketsOwed: number;
+  matsReturned: number;
+  blanketsReturned: number;
+  status: 'open' | 'closed';
   createdAt: number;
-  fulfilledAt?: number;
-  cancelledAt?: number;
+  closedAt?: number;
 }
 
-/** 承诺到期未归产生的联系核实任务（不自动退住） */
-export interface ContactTask {
+/** 补领：须给原因；旧物实际退回后才能进入清洁或报损（申请提交 ≠ 旧物已回） */
+export interface Reclaim {
   id: string;
   familyId: string;
-  promiseId: string;
+  needId: string;
+  itemType: 'mat' | 'blanket';
+  reason: string;
+  /** 旧件（查原交付确定）；遗失件在实际退回前保持「待退回」 */
+  oldItemId: string;
+  newItemId: string;
+  status: 'awaiting_old' | 'closed';
   createdAt: number;
-  status: 'open' | 'resolved';
-  resolution?: string;
-  resolvedAt?: number;
-  notes: string[];
+  closedAt?: number;
+  actor: string;
 }
 
-/** 操作回执（可推进工作流程） */
+/** 操作回执（审计：每个计数都可追到实物与操作者） */
 export interface Receipt {
   seq: number;
   id: string;
@@ -107,22 +163,8 @@ export interface Receipt {
   actor: string;
   summary: string;
   lines: string[];
-  /** 异步确认类回执：已提交、待完成 */
-  pending?: boolean;
   /** 重复提交被幂等忽略时，指向原回执 */
   duplicateOf?: string;
-}
-
-/** 本地模拟适配器的异步确认单 */
-export interface PendingConfirmation {
-  id: string;
-  kind: 'checkin' | 'checkout';
-  familyId: string;
-  assignmentId?: string;
-  submittedAtReal: number;
-  resolveAtReal: number;
-  atVirtual: number;
-  actor: Role;
 }
 
 export interface CommandLogEntry {
@@ -133,36 +175,53 @@ export interface CommandLogEntry {
   receiptIds: string[];
 }
 
-export interface ShelterState {
+export interface BeddingState {
   version: number;
-  /** 演示用虚拟时钟（业务时间，如承诺到期的判定依据） */
+  /** 演示用虚拟时钟（业务时间） */
   virtualNow: number;
-  rooms: Room[];
+  batches: Batch[];
+  nodes: ItemNode[];
   families: Family[];
-  assignments: Assignment[];
-  promises: ReturnPromise[];
-  contactTasks: ContactTask[];
+  needs: Need[];
+  vouchers: Voucher[];
+  deliveries: Delivery[];
+  pendingReturns: PendingReturn[];
+  reclaims: Reclaim[];
   receipts: Receipt[];
-  pending: PendingConfirmation[];
   commandLog: CommandLogEntry[];
   seqCounter: number;
+  /** 包编号序号（按包型分别计数：SET-/PK4-/RPK-） */
+  packSeq: Record<PackKind, number>;
+  /** 封签序号 */
+  sealSeq: number;
 }
 
 export type Command =
-  | { type: 'RegisterFamily'; commandId: string; input: { name: string; size: number; needsAccessible: boolean; coRoomConsent: boolean; consentRoomChange: boolean } }
-  | { type: 'CreateDraft'; commandId: string; familyId: string; roomId: string }
-  | { type: 'CancelDraft'; commandId: string; assignmentId: string }
-  | { type: 'SubmitCheckIn'; commandId: string; assignmentId: string }
-  | { type: 'RegisterLeave'; commandId: string; familyId: string; strategy: ProtectionStrategy; protectionRoomId?: string; expectedReturnAt: number }
-  | { type: 'ConfirmReturn'; commandId: string; familyId: string }
-  | { type: 'ExtendPromise'; commandId: string; familyId: string; newExpectedReturnAt: number }
-  | { type: 'SubmitCheckout'; commandId: string; familyId: string }
-  | { type: 'AddTaskNote'; commandId: string; taskId: string; note: string }
-  | { type: 'CloseRoom'; commandId: string; roomId: string; reason: string }
-  | { type: 'ReopenRoom'; commandId: string; roomId: string }
+  | { type: 'RegisterFamily'; commandId: string; input: { name: string; memberNames: string[] } }
+  | { type: 'SplitFamily'; commandId: string; familyId: string; newName: string; needIds: string[] }
+  | { type: 'SealPack'; commandId: string; packKind: PackKind; childIds: string[] }
+  | { type: 'OpenPack'; commandId: string; packId: string }
+  | { type: 'DetachChild'; commandId: string; childId: string }
+  | { type: 'MoveStock'; commandId: string; nodeIds: string[]; to: 'warehouse' | 'counter' }
+  | { type: 'Deliver'; commandId: string; familyId: string; nodeIds: string[] }
+  | {
+      type: 'ReceiveReturn';
+      commandId: string;
+      familyId: string;
+      items: { itemId: string; condition: 'unused' | 'used' | 'damaged' }[];
+    }
+  | {
+      type: 'Reclaim';
+      commandId: string;
+      familyId: string;
+      needId: string;
+      itemType: 'mat' | 'blanket';
+      reason: string;
+      replacementNodeId: string;
+    }
+  | { type: 'CompleteCleaning'; commandId: string; itemIds: string[] }
   | { type: 'AdvanceClock'; commandId: string; toVirtual: number }
-  | { type: 'ResetDemo'; commandId: string }
-  | { type: 'FinalizeDue'; commandId: string };
+  | { type: 'ResetDemo'; commandId: string };
 
 export interface CmdCtx {
   role: Role;
@@ -170,7 +229,7 @@ export interface CmdCtx {
 }
 
 export interface CmdOutcome {
-  state: ShelterState;
+  state: BeddingState;
   receipts: Receipt[];
   error?: string;
   /** 是否产生了需要持久化/广播的变化 */
