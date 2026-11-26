@@ -1,0 +1,7 @@
+services:
+  web:
+    build: .
+    image: shelter-bed-workbench
+    ports:
+      - "8080:80"
+    restart: unless-stopped
